@@ -6,9 +6,17 @@ from pydantic import BaseModel
 import anthropic
 from tavily import TavilyClient
 import os
+import httpx
 from typing import List, Dict
 
 app = FastAPI()
+
+# --- CONFIGURAZIONE GITHUB ---
+# Aggiungi GITHUB_TOKEN nelle Environment Variables di Render per evitare limiti di velocità
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+REPO_OWNER = "fedez9na"
+REPO_NAME = "openclaw-intelligence"
+HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,19 +25,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Password di accesso
 ACCESS_PASSWORD = os.environ.get("MANPHIX_PASSWORD", "manphix2024")
-
-# API clients
 anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 
 SYSTEM_PROMPT = """Sei Manphix, un assistente informativo autorevole, pacato e cordiale, con un pizzico 
 di sarcasmo e humor giovanile. Non sei un chatbot generico — sei uno specialista con 
 una voce riconoscibile e un punto di vista proprio.
+
+USA LA TUA CONOSCENZA EVOLUTIVA:
+In ogni risposta, tieni conto dei dati forniti nella sezione 'KNOWLEDGE BASE ESTERNA'. 
+Questi dati rappresentano ciò che hai imparato dai tuoi errori o approfondimenti passati.
 
 ARGOMENTI DI COMPETENZA:
 - Serie A e diritti TV (DAZN, Sky Sport, Mediaset, Amazon Prime Video Sport)
@@ -65,6 +73,7 @@ Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare
 il modello AI sottostante."""
 
 # Sessioni in memoria
+
 sessions: Dict[str, List[Dict]] = {}
 
 class LoginRequest(BaseModel):
@@ -76,6 +85,40 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+
+# --- FUNZIONI DI RECUPERO CONOSCENZA ---
+
+async def get_github_file_content(file_path: str):
+    """Scarica il contenuto raw di un singolo file"""
+    url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{file_path}"
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(url, headers=HEADERS)
+            return resp.text if resp.status_code == 200 else ""
+        except:
+            return ""
+
+async def get_all_learnings():
+    """Scarica e concatena tutti i file nella cartella .learnings"""
+    api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/.learnings"
+    all_lessons = ""
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(api_url, headers=HEADERS)
+            if resp.status_code == 200:
+                files = resp.json()
+                for file_info in files:
+                    if file_info["type"] == "file":
+                        # Scarichiamo il contenuto raw di ogni file trovato
+                        f_resp = await client.get(file_info["download_url"])
+                        if f_resp.status_code == 200:
+                            all_lessons += f"\n--- Fonte: {file_info['name']} ---\n{f_resp.text}\n"
+            return all_lessons
+        except:
+            return ""
+
+# --- ENDPOINTS ---
 
 @app.get("/")
 async def root():
@@ -95,27 +138,33 @@ async def chat(req: ChatRequest):
     if req.session_id not in sessions:
         raise HTTPException(status_code=401, detail="Sessione non valida")
 
+    # 1. Recupero dinamico della conoscenza da GitHub
+    knowledge_main = await get_github_file_content("CLAUDE.md")
+    knowledge_folder = await get_all_learnings()
+    full_external_knowledge = f"{knowledge_main}\n{knowledge_folder}"
+
     history = sessions[req.session_id]
 
-    # Cerca sul web
+    # 2. Ricerca Web (Tavily)
     try:
         risultati = tavily_client.search(req.message, max_results=3, search_depth="basic")
-        contesto = ""
-        for r in risultati["results"]:
-            contesto += f"- {r['title']}: {r['content']}\n\n"
+        contesto = "".join([f"- {r['title']}: {r['content']}\n\n" for r in risultati["results"]])
     except:
         contesto = ""
 
     messaggio = req.message
     if contesto:
-        messaggio = f"Contesto aggiornato dal web:\n{contesto}\n\nDomanda: {req.message}"
+        messaggio = f"Contesto Web:\n{contesto}\n\nDomanda: {req.message}"
 
     history.append({"role": "user", "content": messaggio})
 
+    # 3. Generazione risposta con Prompt arricchito
+    enriched_prompt = f"{SYSTEM_PROMPT}\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
+
     response = anthropic_client.messages.create(
-        model="claude-haiku-4-5",
+        model="claude-3-5-sonnet-20241022",
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
+        system=enriched_prompt,
         messages=history,
     )
 
