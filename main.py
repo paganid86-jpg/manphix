@@ -282,12 +282,31 @@ async def chat(req: ChatRequest):
     # 3. Recupero storia della sessione corrente dal DB
     history = await get_history(req.session_id)
 
-    # 4. Ricerca Web (Tavily)
+    # 4. PUNTO 1 — Query preprocessing: Haiku riformula la domanda in query ottimale per Tavily
+    try:
+        query_response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{
+                "role": "user",
+                "content": f"""Trasforma questa domanda in una query di ricerca web ottimale.
+Rispondi SOLO con la query, niente altro. Max 10 parole. In italiano o inglese a seconda della lingua.
+Aggiungi l'anno corrente (2026) se la domanda riguarda eventi recenti o notizie.
+
+Domanda: {req.message}"""
+            }]
+        )
+        search_query = query_response.content[0].text.strip()
+    except:
+        search_query = req.message  # fallback: usa la domanda originale
+
+    # 4b. PUNTO 4 — Ricerca Web (Tavily) con topic=news e query ottimizzata
     try:
         risultati = tavily_client.search(
-            req.message,
+            search_query,
             max_results=5,
             search_depth="advanced",
+            topic="news",
             include_answer=True,
             include_raw_content=False
         )
