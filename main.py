@@ -14,8 +14,8 @@ app = FastAPI()
 # --- CONFIGURAZIONE GITHUB ---
 # Aggiungi GITHUB_TOKEN nelle Environment Variables di Render per evitare limiti di velocità
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-REPO_OWNER = "fedez9na"
-REPO_NAME = "openclaw-intelligence"
+REPO_OWNER = "paganid86-jpg"
+REPO_NAME = "manphix-brain"
 HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 app.add_middleware(
