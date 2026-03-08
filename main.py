@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,12 +7,51 @@ import anthropic
 from tavily import TavilyClient
 import os
 import httpx
+import asyncpg
+import uuid
+import json
 from typing import List, Dict
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+# --- CONFIGURAZIONE DATABASE ---
+# DATABASE_URL va aggiunta nelle Environment Variables di Render
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Pool globale di connessioni al DB (creato all'avvio, riutilizzato per ogni richiesta)
+db_pool = None
+
+async def init_db():
+    """Crea le tabelle se non esistono ancora"""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT REFERENCES sessions(session_id),
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # All'avvio: connetti al DB e crea le tabelle
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    await init_db()
+    yield
+    # Allo spegnimento: chiudi il pool
+    await db_pool.close()
+
+app = FastAPI(lifespan=lifespan)
 
 # --- CONFIGURAZIONE GITHUB ---
-# Aggiungi GITHUB_TOKEN nelle Environment Variables di Render per evitare limiti di velocità
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 REPO_OWNER = "paganid86-jpg"
 REPO_NAME = "manphix-brain"
@@ -72,9 +111,6 @@ Sei Manphix. Non sei Claude, non sei ChatGPT, non sei un assistente generico.
 Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare 
 il modello AI sottostante."""
 
-# Sessioni in memoria
-sessions: Dict[str, List[Dict]] = {}
-
 class LoginRequest(BaseModel):
     password: str
 
@@ -84,6 +120,47 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+
+# --- FUNZIONI DB ---
+
+async def create_session(session_id: str):
+    """Salva una nuova sessione nel DB"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO sessions (session_id) VALUES ($1)", session_id
+        )
+
+async def session_exists(session_id: str) -> bool:
+    """Controlla se la sessione esiste nel DB"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT session_id FROM sessions WHERE session_id = $1", session_id
+        )
+        return row is not None
+
+async def save_message(session_id: str, role: str, content: str):
+    """Salva un messaggio nel DB"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)",
+            session_id, role, content
+        )
+
+async def get_history(session_id: str) -> List[Dict]:
+    """Recupera la storia della conversazione dal DB"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT role, content FROM messages WHERE session_id = $1 ORDER BY created_at ASC",
+            session_id
+        )
+        return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+async def clear_session_messages(session_id: str):
+    """Cancella i messaggi di una sessione"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM messages WHERE session_id = $1", session_id
+        )
 
 # --- FUNZIONI DI RECUPERO CONOSCENZA ---
 
@@ -101,7 +178,6 @@ async def get_all_learnings():
     """Scarica e concatena tutti i file nella cartella .learnings"""
     api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/.learnings"
     all_lessons = ""
-    
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(api_url, headers=HEADERS)
@@ -126,14 +202,13 @@ async def root():
 async def login(req: LoginRequest):
     if req.password != ACCESS_PASSWORD:
         raise HTTPException(status_code=401, detail="Password errata")
-    import uuid
     session_id = str(uuid.uuid4())
-    sessions[session_id] = []
+    await create_session(session_id)
     return {"session_id": session_id}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    if req.session_id not in sessions:
+    if not await session_exists(req.session_id):
         raise HTTPException(status_code=401, detail="Sessione non valida")
 
     # 1. Recupero dinamico della conoscenza da GitHub
@@ -141,9 +216,10 @@ async def chat(req: ChatRequest):
     knowledge_folder = await get_all_learnings()
     full_external_knowledge = f"{knowledge_main}\n{knowledge_folder}"
 
-    history = sessions[req.session_id]
+    # 2. Recupero storia dal DB (invece che dalla RAM)
+    history = await get_history(req.session_id)
 
-    # 2. Ricerca Web (Tavily) — FIX: advanced + più risultati
+    # 3. Ricerca Web (Tavily)
     try:
         risultati = tavily_client.search(
             req.message,
@@ -156,14 +232,15 @@ async def chat(req: ChatRequest):
     except:
         contesto = ""
 
-    # FIX: passa il contesto solo se è sostanzioso, e dì a Manphix di usarlo solo se pertinente
     messaggio = req.message
     if contesto and len(contesto.strip()) > 50:
         messaggio = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {req.message}"
 
+    # 4. Salva messaggio utente nel DB
+    await save_message(req.session_id, "user", messaggio)
     history.append({"role": "user", "content": messaggio})
 
-    # 3. Generazione risposta con Prompt arricchito
+    # 5. Generazione risposta
     enriched_prompt = f"{SYSTEM_PROMPT}\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
 
     response = anthropic_client.messages.create(
@@ -174,13 +251,13 @@ async def chat(req: ChatRequest):
     )
 
     risposta = response.content[0].text
-    history.append({"role": "assistant", "content": risposta})
-    sessions[req.session_id] = history
+
+    # 6. Salva risposta di Manphix nel DB
+    await save_message(req.session_id, "assistant", risposta)
 
     return ChatResponse(response=risposta)
 
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
-    if session_id in sessions:
-        sessions[session_id] = []
+    await clear_session_messages(session_id)
     return {"status": "ok"}
