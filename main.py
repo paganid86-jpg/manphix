@@ -73,7 +73,6 @@ Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare
 il modello AI sottostante."""
 
 # Sessioni in memoria
-
 sessions: Dict[str, List[Dict]] = {}
 
 class LoginRequest(BaseModel):
@@ -110,7 +109,6 @@ async def get_all_learnings():
                 files = resp.json()
                 for file_info in files:
                     if file_info["type"] == "file":
-                        # Scarichiamo il contenuto raw di ogni file trovato
                         f_resp = await client.get(file_info["download_url"])
                         if f_resp.status_code == 200:
                             all_lessons += f"\n--- Fonte: {file_info['name']} ---\n{f_resp.text}\n"
@@ -145,16 +143,23 @@ async def chat(req: ChatRequest):
 
     history = sessions[req.session_id]
 
-    # 2. Ricerca Web (Tavily)
+    # 2. Ricerca Web (Tavily) — FIX: advanced + più risultati
     try:
-        risultati = tavily_client.search(req.message, max_results=3, search_depth="basic")
+        risultati = tavily_client.search(
+            req.message,
+            max_results=5,
+            search_depth="advanced",
+            include_answer=True,
+            include_raw_content=False
+        )
         contesto = "".join([f"- {r['title']}: {r['content']}\n\n" for r in risultati["results"]])
     except:
         contesto = ""
 
+    # FIX: passa il contesto solo se è sostanzioso, e dì a Manphix di usarlo solo se pertinente
     messaggio = req.message
-    if contesto:
-        messaggio = f"Contesto Web:\n{contesto}\n\nDomanda: {req.message}"
+    if contesto and len(contesto.strip()) > 50:
+        messaggio = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {req.message}"
 
     history.append({"role": "user", "content": messaggio})
 
