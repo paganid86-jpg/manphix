@@ -9,15 +9,12 @@ import os
 import httpx
 import asyncpg
 import uuid
-import json
 from typing import List, Dict
 from contextlib import asynccontextmanager
 
 # --- CONFIGURAZIONE DATABASE ---
-# DATABASE_URL va aggiunta nelle Environment Variables di Render
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Pool globale di connessioni al DB (creato all'avvio, riutilizzato per ogni richiesta)
 db_pool = None
 
 async def init_db():
@@ -38,15 +35,23 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # LIVELLO 2: tabella per i riassunti automatici
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS summaries (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT REFERENCES sessions(session_id),
+                summary TEXT NOT NULL,
+                message_count INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # All'avvio: connetti al DB e crea le tabelle
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     await init_db()
     yield
-    # Allo spegnimento: chiudi il pool
     await db_pool.close()
 
 app = FastAPI(lifespan=lifespan)
@@ -124,22 +129,15 @@ class ChatResponse(BaseModel):
 # --- FUNZIONI DB ---
 
 async def create_session(session_id: str):
-    """Salva una nuova sessione nel DB"""
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO sessions (session_id) VALUES ($1)", session_id
-        )
+        await conn.execute("INSERT INTO sessions (session_id) VALUES ($1)", session_id)
 
 async def session_exists(session_id: str) -> bool:
-    """Controlla se la sessione esiste nel DB"""
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT session_id FROM sessions WHERE session_id = $1", session_id
-        )
+        row = await conn.fetchrow("SELECT session_id FROM sessions WHERE session_id = $1", session_id)
         return row is not None
 
 async def save_message(session_id: str, role: str, content: str):
-    """Salva un messaggio nel DB"""
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)",
@@ -147,7 +145,6 @@ async def save_message(session_id: str, role: str, content: str):
         )
 
 async def get_history(session_id: str) -> List[Dict]:
-    """Recupera la storia della conversazione dal DB"""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT role, content FROM messages WHERE session_id = $1 ORDER BY created_at ASC",
@@ -155,17 +152,61 @@ async def get_history(session_id: str) -> List[Dict]:
         )
         return [{"role": r["role"], "content": r["content"]} for r in rows]
 
-async def clear_session_messages(session_id: str):
-    """Cancella i messaggi di una sessione"""
+async def count_messages(session_id: str) -> int:
+    """Conta i messaggi totali della sessione"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) as cnt FROM messages WHERE session_id = $1", session_id
+        )
+        return row["cnt"]
+
+async def save_summary(session_id: str, summary: str, message_count: int):
+    """Salva il riassunto nel DB"""
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "DELETE FROM messages WHERE session_id = $1", session_id
+            "INSERT INTO summaries (session_id, summary, message_count) VALUES ($1, $2, $3)",
+            session_id, summary, message_count
         )
+
+async def generate_and_save_summary(session_id: str, history: List[Dict], message_count: int):
+    """
+    LIVELLO 2: Chiama Haiku per generare un riassunto della conversazione e lo salva.
+    Viene triggerato ogni 7 messaggi automaticamente.
+    """
+    try:
+        conversation_text = "\n".join([
+            f"{m['role'].upper()}: {m['content'][:500]}"
+            for m in history
+        ])
+
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[{
+                "role": "user",
+                "content": f"""Riassumi questa conversazione in modo conciso (max 150 parole).
+Includi: argomenti trattati, opinioni espresse, informazioni importanti emerse.
+Scrivi in italiano, in terza persona (es. "L'utente ha chiesto...").
+
+CONVERSAZIONE:
+{conversation_text}"""
+            }]
+        )
+
+        summary = response.content[0].text
+        await save_summary(session_id, summary, message_count)
+        print(f"[Manphix] Riassunto salvato per sessione {session_id} dopo {message_count} messaggi")
+    except Exception as e:
+        # Il riassunto è opzionale — se fallisce non blocchiamo la chat
+        print(f"[Manphix] Errore generazione riassunto: {e}")
+
+async def clear_session_messages(session_id: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM messages WHERE session_id = $1", session_id)
 
 # --- FUNZIONI DI RECUPERO CONOSCENZA ---
 
 async def get_github_file_content(file_path: str):
-    """Scarica il contenuto raw di un singolo file"""
     url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{file_path}"
     async with httpx.AsyncClient() as client:
         try:
@@ -175,7 +216,6 @@ async def get_github_file_content(file_path: str):
             return ""
 
 async def get_all_learnings():
-    """Scarica e concatena tutti i file nella cartella .learnings"""
     api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/.learnings"
     all_lessons = ""
     async with httpx.AsyncClient() as client:
@@ -211,12 +251,12 @@ async def chat(req: ChatRequest):
     if not await session_exists(req.session_id):
         raise HTTPException(status_code=401, detail="Sessione non valida")
 
-    # 1. Recupero dinamico della conoscenza da GitHub
+    # 1. Recupero conoscenza da GitHub
     knowledge_main = await get_github_file_content("CLAUDE.md")
     knowledge_folder = await get_all_learnings()
     full_external_knowledge = f"{knowledge_main}\n{knowledge_folder}"
 
-    # 2. Recupero storia dal DB (invece che dalla RAM)
+    # 2. Recupero storia dal DB
     history = await get_history(req.session_id)
 
     # 3. Ricerca Web (Tavily)
@@ -254,6 +294,12 @@ async def chat(req: ChatRequest):
 
     # 6. Salva risposta di Manphix nel DB
     await save_message(req.session_id, "assistant", risposta)
+    history.append({"role": "assistant", "content": risposta})
+
+    # 7. LIVELLO 2: ogni 7 messaggi genera automaticamente un riassunto
+    total_messages = await count_messages(req.session_id)
+    if total_messages % 7 == 0:
+        await generate_and_save_summary(req.session_id, history, total_messages)
 
     return ChatResponse(response=risposta)
 
