@@ -35,7 +35,6 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        # LIVELLO 2: tabella per i riassunti automatici
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS summaries (
                 id SERIAL PRIMARY KEY,
@@ -82,6 +81,10 @@ una voce riconoscibile e un punto di vista proprio.
 USA LA TUA CONOSCENZA EVOLUTIVA:
 In ogni risposta, tieni conto dei dati forniti nella sezione 'KNOWLEDGE BASE ESTERNA'. 
 Questi dati rappresentano ciò che hai imparato dai tuoi errori o approfondimenti passati.
+
+USA LA TUA MEMORIA STORICA:
+Nella sezione 'MEMORIA CONVERSAZIONI PASSATE' trovi riassunti di conversazioni precedenti.
+Usali per mantenere continuità, ricordare preferenze e riferimenti già discussi.
 
 ARGOMENTI DI COMPETENZA:
 - Serie A e diritti TV (DAZN, Sky Sport, Mediaset, Amazon Prime Video Sport)
@@ -153,7 +156,6 @@ async def get_history(session_id: str) -> List[Dict]:
         return [{"role": r["role"], "content": r["content"]} for r in rows]
 
 async def count_messages(session_id: str) -> int:
-    """Conta i messaggi totali della sessione"""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT COUNT(*) as cnt FROM messages WHERE session_id = $1", session_id
@@ -161,7 +163,6 @@ async def count_messages(session_id: str) -> int:
         return row["cnt"]
 
 async def save_summary(session_id: str, summary: str, message_count: int):
-    """Salva il riassunto nel DB"""
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO summaries (session_id, summary, message_count) VALUES ($1, $2, $3)",
@@ -169,16 +170,12 @@ async def save_summary(session_id: str, summary: str, message_count: int):
         )
 
 async def generate_and_save_summary(session_id: str, history: List[Dict], message_count: int):
-    """
-    LIVELLO 2: Chiama Haiku per generare un riassunto della conversazione e lo salva.
-    Viene triggerato ogni 7 messaggi automaticamente.
-    """
+    """Livello 2: genera e salva riassunto ogni 7 messaggi"""
     try:
         conversation_text = "\n".join([
             f"{m['role'].upper()}: {m['content'][:500]}"
             for m in history
         ])
-
         response = anthropic_client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=512,
@@ -192,13 +189,36 @@ CONVERSAZIONE:
 {conversation_text}"""
             }]
         )
-
         summary = response.content[0].text
         await save_summary(session_id, summary, message_count)
         print(f"[Manphix] Riassunto salvato per sessione {session_id} dopo {message_count} messaggi")
     except Exception as e:
-        # Il riassunto è opzionale — se fallisce non blocchiamo la chat
         print(f"[Manphix] Errore generazione riassunto: {e}")
+
+async def get_recent_summaries(limit: int = 5) -> str:
+    """
+    LIVELLO 3: recupera gli ultimi N riassunti da TUTTE le sessioni,
+    ordinati dal più recente. Servono per dare a Manphix memoria storica
+    delle conversazioni passate, indipendentemente dalla sessione corrente.
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT summary, created_at 
+               FROM summaries 
+               ORDER BY created_at DESC 
+               LIMIT $1""",
+            limit
+        )
+        if not rows:
+            return ""
+        
+        # Costruiamo il testo da iniettare nel prompt, dal più vecchio al più recente
+        summaries_text = ""
+        for i, row in enumerate(reversed(rows), 1):
+            date_str = row["created_at"].strftime("%d/%m/%Y %H:%M")
+            summaries_text += f"\n[Conversazione {i} — {date_str}]\n{row['summary']}\n"
+        
+        return summaries_text
 
 async def clear_session_messages(session_id: str):
     async with db_pool.acquire() as conn:
@@ -256,10 +276,13 @@ async def chat(req: ChatRequest):
     knowledge_folder = await get_all_learnings()
     full_external_knowledge = f"{knowledge_main}\n{knowledge_folder}"
 
-    # 2. Recupero storia dal DB
+    # 2. LIVELLO 3: recupero riassunti delle conversazioni passate
+    past_summaries = await get_recent_summaries(limit=5)
+
+    # 3. Recupero storia della sessione corrente dal DB
     history = await get_history(req.session_id)
 
-    # 3. Ricerca Web (Tavily)
+    # 4. Ricerca Web (Tavily)
     try:
         risultati = tavily_client.search(
             req.message,
@@ -276,13 +299,17 @@ async def chat(req: ChatRequest):
     if contesto and len(contesto.strip()) > 50:
         messaggio = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {req.message}"
 
-    # 4. Salva messaggio utente nel DB
+    # 5. Salva messaggio utente nel DB
     await save_message(req.session_id, "user", messaggio)
     history.append({"role": "user", "content": messaggio})
 
-    # 5. Generazione risposta
-    enriched_prompt = f"{SYSTEM_PROMPT}\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
+    # 6. Costruisci prompt arricchito con tutti e 3 i livelli di memoria
+    enriched_prompt = SYSTEM_PROMPT
+    enriched_prompt += f"\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
+    if past_summaries:
+        enriched_prompt += f"\n\n### MEMORIA CONVERSAZIONI PASSATE:\n{past_summaries}"
 
+    # 7. Generazione risposta
     response = anthropic_client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1024,
@@ -292,11 +319,11 @@ async def chat(req: ChatRequest):
 
     risposta = response.content[0].text
 
-    # 6. Salva risposta di Manphix nel DB
+    # 8. Salva risposta di Manphix nel DB
     await save_message(req.session_id, "assistant", risposta)
     history.append({"role": "assistant", "content": risposta})
 
-    # 7. LIVELLO 2: ogni 7 messaggi genera automaticamente un riassunto
+    # 9. Ogni 7 messaggi genera riassunto automatico (Livello 2)
     total_messages = await count_messages(req.session_id)
     if total_messages % 7 == 0:
         await generate_and_save_summary(req.session_id, history, total_messages)
