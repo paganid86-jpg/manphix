@@ -162,7 +162,7 @@ async def chat(req: ChatRequest):
     enriched_prompt = f"{SYSTEM_PROMPT}\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
 
     response = anthropic_client.messages.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-haiku-3-5-20241022",
         max_tokens=1024,
         system=enriched_prompt,
         messages=history,
