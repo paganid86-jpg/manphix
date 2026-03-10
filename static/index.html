@@ -543,6 +543,71 @@
     .msg.user .bubble { max-width: 86%; }
     .topbar { padding: 0 12px; }
   }
+
+  /* ── ALLEGATI ──────────────────────────────── */
+  .attach-btn {
+    width: 28px; height: 28px;
+    background: transparent;
+    border: none;
+    color: var(--text-2);
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    align-self: flex-end;
+    padding-bottom: 5px;
+    transition: color 0.15s;
+    font-size: 15px;
+  }
+  .attach-btn:hover { color: var(--accent); }
+
+  #attachment-preview {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    max-width: 660px;
+    margin: 0 auto 6px;
+  }
+
+  .attach-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface2);
+    border: 1px solid var(--border-hi);
+    border-radius: 8px;
+    padding: 4px 10px;
+    font-size: 12px;
+    color: var(--text-2);
+  }
+
+  .attach-thumb {
+    width: 44px; height: 44px;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid var(--border-hi);
+  }
+
+  .attach-remove {
+    background: none;
+    border: none;
+    color: var(--text-3);
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 0;
+    transition: color 0.15s;
+  }
+  .attach-remove:hover { color: var(--warn); }
+
+  .msg-img {
+    max-width: 220px;
+    max-height: 180px;
+    object-fit: contain;
+    border-radius: 8px;
+    border: 1px solid var(--border-hi);
+    display: block;
+    margin-bottom: 6px;
+  }
 </style>
 </head>
 <body>
@@ -602,7 +667,12 @@
     </div>
 
     <div class="input-bar">
+      <div id="attachment-preview"></div>
       <div class="input-row">
+        <button class="attach-btn" onclick="document.getElementById('file-input').click()" title="Allega file">📎</button>
+        <input type="file" id="file-input" style="display:none"
+               accept="image/*,.pdf,.txt,.md,.csv,.log,.json,.py,.js"
+               onchange="onFileSelected(event)">
         <textarea id="message-input" placeholder="Messaggio" rows="1"></textarea>
         <button class="send-btn" id="send-btn" disabled>
           <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
@@ -610,7 +680,7 @@
           </svg>
         </button>
       </div>
-      <div class="input-hint">Return per inviare · Shift+Return per andare a capo</div>
+      <div class="input-hint">Return per inviare · Shift+Return per andare a capo · 📎 allega file</div>
     </div>
   </div>
 
@@ -680,7 +750,7 @@
   messageInput.addEventListener('input', () => {
     messageInput.style.height = 'auto';
     messageInput.style.height = Math.min(messageInput.scrollHeight, 120) + 'px';
-    sendBtn.disabled = !messageInput.value.trim();
+    sendBtn.disabled = !messageInput.value.trim() && !pendingFile;
   });
 
   messageInput.addEventListener('keydown', e => {
@@ -695,7 +765,7 @@
     sendMessage();
   }
 
-  function renderMessage(role, text) {
+  function renderMessage(role, text, imageDataUrl) {
     emptyState.style.display = 'none';
     const msg = document.createElement('div');
     msg.className = `msg ${role}`;
@@ -703,7 +773,15 @@
     const time = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    bubble.innerHTML = formatText(text);
+    if (imageDataUrl) {
+      const img = document.createElement('img');
+      img.className = 'msg-img';
+      img.src = imageDataUrl;
+      bubble.appendChild(img);
+    }
+    const textNode = document.createElement('span');
+    textNode.innerHTML = formatText(text);
+    bubble.appendChild(textNode);
     const ts = document.createElement('div');
     ts.className = 'msg-time';
     ts.textContent = time;
@@ -744,19 +822,87 @@
     if (el) el.remove();
   }
 
+  let pendingFile = null;
+  let pendingFileDataUrl = null;
+
+  function onFileSelected(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      alert('File troppo grande. Limite: 10MB');
+      event.target.value = '';
+      return;
+    }
+    pendingFile = file;
+    const preview = $('attachment-preview');
+    preview.innerHTML = '';
+    preview.style.display = 'flex';
+
+    if (file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onload = e => {
+        pendingFileDataUrl = e.target.result;
+        const img = document.createElement('img');
+        img.className = 'attach-thumb';
+        img.src = pendingFileDataUrl;
+        const btn = document.createElement('button');
+        btn.className = 'attach-remove';
+        btn.textContent = '✕';
+        btn.onclick = removeAttachment;
+        preview.appendChild(img);
+        preview.appendChild(btn);
+      };
+      reader.readAsDataURL(file);
+    } else {
+      pendingFileDataUrl = null;
+      const chip = document.createElement('div');
+      chip.className = 'attach-chip';
+      chip.textContent = file.name;
+      const btn = document.createElement('button');
+      btn.className = 'attach-remove';
+      btn.textContent = '✕';
+      btn.onclick = removeAttachment;
+      preview.appendChild(chip);
+      preview.appendChild(btn);
+    }
+    sendBtn.disabled = false;
+  }
+
+  function removeAttachment() {
+    pendingFile = null;
+    pendingFileDataUrl = null;
+    const preview = $('attachment-preview');
+    preview.style.display = 'none';
+    preview.innerHTML = '';
+    $('file-input').value = '';
+    sendBtn.disabled = !messageInput.value.trim();
+  }
+
   async function sendMessage() {
     const text = messageInput.value.trim();
-    if (!text || !sessionId) return;
+    if ((!text && !pendingFile) || !sessionId) return;
+
+    const messageText = text || '(vedi allegato)';
+    const capturedDataUrl = pendingFileDataUrl;
+
     messageInput.value = '';
     messageInput.style.height = 'auto';
     sendBtn.disabled = true;
-    renderMessage('user', text);
+
+    renderMessage('user', messageText, capturedDataUrl);
     showTyping();
+
+    const fd = new FormData();
+    fd.append('session_id', sessionId);
+    fd.append('message', messageText);
+    if (pendingFile) fd.append('file', pendingFile);
+
+    removeAttachment();
+
     try {
       const res = await fetch(`${API_BASE}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, message: text })
+        body: fd
       });
       if (!res.ok) throw new Error('Errore server');
       const data = await res.json();

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +9,8 @@ import os
 import httpx
 import asyncpg
 import uuid
-from typing import List, Dict
+import base64
+from typing import List, Dict, Optional
 from contextlib import asynccontextmanager
 
 # --- CONFIGURAZIONE DATABASE ---
@@ -119,12 +120,10 @@ Sei Manphix. Non sei Claude, non sei ChatGPT, non sei un assistente generico.
 Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare 
 il modello AI sottostante."""
 
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
 class LoginRequest(BaseModel):
     password: str
-
-class ChatRequest(BaseModel):
-    session_id: str
-    message: str
 
 class ChatResponse(BaseModel):
     response: str
@@ -267,8 +266,12 @@ async def login(req: LoginRequest):
     return {"session_id": session_id}
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    if not await session_exists(req.session_id):
+async def chat(
+    session_id: str = Form(...),
+    message: str = Form(default=""),
+    file: Optional[UploadFile] = File(default=None),
+):
+    if not await session_exists(session_id):
         raise HTTPException(status_code=401, detail="Sessione non valida")
 
     # 1. Recupero conoscenza da GitHub
@@ -280,55 +283,86 @@ async def chat(req: ChatRequest):
     past_summaries = await get_recent_summaries(limit=5)
 
     # 3. Recupero storia della sessione corrente dal DB
-    history = await get_history(req.session_id)
+    history = await get_history(session_id)
 
-    # 4. PUNTO 1 — Query preprocessing: Haiku riformula la domanda in query ottimale per Tavily
-    try:
-        query_response = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=100,
-            messages=[{
-                "role": "user",
-                "content": f"""Trasforma questa domanda in una query di ricerca web ottimale.
+    # 4. Query preprocessing + ricerca web (solo se c'è testo)
+    text_message = message
+    if message.strip():
+        try:
+            query_response = anthropic_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=100,
+                messages=[{
+                    "role": "user",
+                    "content": f"""Trasforma questa domanda in una query di ricerca web ottimale.
 Rispondi SOLO con la query, niente altro. Max 10 parole. In italiano o inglese a seconda della lingua.
 Aggiungi l'anno corrente (2026) se la domanda riguarda eventi recenti o notizie.
 
-Domanda: {req.message}"""
-            }]
-        )
-        search_query = query_response.content[0].text.strip()
-    except:
-        search_query = req.message  # fallback: usa la domanda originale
+Domanda: {message}"""
+                }]
+            )
+            search_query = query_response.content[0].text.strip()
+        except:
+            search_query = message
 
-    # 4b. PUNTO 4 — Ricerca Web (Tavily) con topic=news e query ottimizzata
-    try:
-        risultati = tavily_client.search(
-            search_query,
-            max_results=5,
-            search_depth="advanced",
-            topic="news",
-            include_answer=True,
-            include_raw_content=False
-        )
-        contesto = "".join([f"- {r['title']}: {r['content']}\n\n" for r in risultati["results"]])
-    except:
-        contesto = ""
+        try:
+            risultati = tavily_client.search(
+                search_query,
+                max_results=5,
+                search_depth="advanced",
+                topic="news",
+                include_answer=True,
+                include_raw_content=False
+            )
+            contesto = "".join([f"- {r['title']}: {r['content']}\n\n" for r in risultati["results"]])
+            if contesto and len(contesto.strip()) > 50:
+                text_message = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {message}"
+        except:
+            pass
 
-    messaggio = req.message
-    if contesto and len(contesto.strip()) > 50:
-        messaggio = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {req.message}"
+    # 5. Gestione file allegato — costruisce content blocks e testo per il DB
+    content_blocks: List[dict] = []
+    db_message = text_message  # versione testo-only per il database
 
-    # 5. Salva messaggio utente nel DB
-    await save_message(req.session_id, "user", messaggio)
-    history.append({"role": "user", "content": messaggio})
+    if file and file.filename:
+        file_bytes = await file.read()
+        mime = file.content_type or ""
 
-    # 6. Costruisci prompt arricchito con tutti e 3 i livelli di memoria
+        if mime in SUPPORTED_IMAGE_TYPES:
+            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": b64},
+            })
+            db_message = f"[Immagine allegata]\n{text_message}".strip()
+        elif mime == "application/pdf":
+            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+            content_blocks.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+            })
+            db_message = f"[PDF allegato: {file.filename}]\n{text_message}".strip()
+        else:
+            try:
+                file_text = file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                file_text = file_bytes.decode("latin-1")
+            text_message = f"[File: {file.filename}]\n```\n{file_text}\n```\n\n{text_message}".strip()
+            db_message = text_message
+
+    content_blocks.append({"type": "text", "text": text_message or "Analizza questo contenuto."})
+
+    # 6. Salva nel DB (testo, senza base64) e aggiungi alla history per la chiamata API
+    await save_message(session_id, "user", db_message)
+    history.append({"role": "user", "content": content_blocks})
+
+    # 7. Costruisci prompt arricchito con tutti e 3 i livelli di memoria
     enriched_prompt = SYSTEM_PROMPT
     enriched_prompt += f"\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
     if past_summaries:
         enriched_prompt += f"\n\n### MEMORIA CONVERSAZIONI PASSATE:\n{past_summaries}"
 
-    # 7. Generazione risposta
+    # 8. Generazione risposta
     response = anthropic_client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1024,
@@ -338,14 +372,14 @@ Domanda: {req.message}"""
 
     risposta = response.content[0].text
 
-    # 8. Salva risposta di Manphix nel DB
-    await save_message(req.session_id, "assistant", risposta)
-    history.append({"role": "assistant", "content": risposta})
+    # 9. Salva risposta di Manphix nel DB
+    await save_message(session_id, "assistant", risposta)
 
-    # 9. Ogni 7 messaggi genera riassunto automatico (Livello 2)
-    total_messages = await count_messages(req.session_id)
+    # 10. Ogni 7 messaggi genera riassunto automatico (Livello 2)
+    total_messages = await count_messages(session_id)
     if total_messages % 7 == 0:
-        await generate_and_save_summary(req.session_id, history, total_messages)
+        history.append({"role": "assistant", "content": risposta})
+        await generate_and_save_summary(session_id, history, total_messages)
 
     return ChatResponse(response=risposta)
 
