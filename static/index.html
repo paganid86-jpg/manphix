@@ -968,7 +968,10 @@
         method: 'POST',
         body: fd
       });
-      if (!res.ok) throw new Error('Errore server');
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `Errore server (${res.status})`);
+      }
       const data = await res.json();
       hideTyping();
       renderMessage('assistant', data.response);
