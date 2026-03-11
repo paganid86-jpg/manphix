@@ -357,19 +357,42 @@
     letter-spacing: -0.003em;
   }
 
+  /* ── Bolla utente: argento metallizzato ── */
   .msg.user .bubble {
-    background: var(--surface3);
-    color: var(--text-1);
+    background: linear-gradient(145deg,
+      #f0f0f8 0%,
+      #d4d4e8 22%,
+      #a8a8c4 48%,
+      #ccccdf 74%,
+      #ededf8 100%
+    );
+    color: #0e0e20;
     padding: 10px 14px;
-    border-radius: 18px;
-    border-bottom-right-radius: 5px;
+    border-radius: 18px 18px 4px 18px;
     max-width: 75%;
+    box-shadow:
+      0 2px 18px rgba(140,140,180,0.20),
+      inset 0 1px 0 rgba(255,255,255,0.60),
+      inset 0 -1px 0 rgba(0,0,0,0.07);
   }
 
+  /* ── Bolla Manphix: viola metallizzato ── */
   .msg.assistant .bubble {
-    color: var(--text-1);
-    padding: 10px 0;
-    max-width: 100%;
+    background: linear-gradient(145deg,
+      #c4b5fd 0%,
+      #8b5cf6 22%,
+      #5b21b6 48%,
+      #7c3aed 74%,
+      #a78bfa 100%
+    );
+    color: rgba(255,255,255,0.97);
+    padding: 10px 14px;
+    border-radius: 18px 18px 18px 4px;
+    max-width: 75%;
+    box-shadow:
+      0 2px 20px rgba(109,40,217,0.35),
+      inset 0 1px 0 rgba(255,255,255,0.20),
+      inset 0 -1px 0 rgba(0,0,0,0.15);
   }
 
   .msg-time {
@@ -379,20 +402,34 @@
     letter-spacing: 0.01em;
   }
 
-  /* Markdown */
-  .bubble strong { font-weight: 600; }
-  .bubble em { color: var(--text-2); font-style: italic; }
-  .bubble code {
-    background: var(--surface3);
+  /* Markdown — utente */
+  .msg.user .bubble strong { font-weight: 700; color: #06061a; }
+  .msg.user .bubble em { color: #4a4a6a; font-style: italic; }
+  .msg.user .bubble code {
+    background: rgba(0,0,30,0.10);
     border-radius: 5px;
     padding: 1px 6px;
     font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
     font-size: 13px;
-    color: rgba(255,255,255,0.65);
+    color: #2a2a50;
     letter-spacing: 0;
   }
 
-  .bubble table {
+  /* Markdown — Manphix */
+  .msg.assistant .bubble strong { font-weight: 700; color: #fff; }
+  .msg.assistant .bubble em { color: rgba(255,255,255,0.70); font-style: italic; }
+  .msg.assistant .bubble code {
+    background: rgba(0,0,0,0.22);
+    border-radius: 5px;
+    padding: 1px 6px;
+    font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    font-size: 13px;
+    color: rgba(255,255,255,0.88);
+    letter-spacing: 0;
+  }
+
+  /* Tabelle — Manphix */
+  .msg.assistant .bubble table {
     width: 100%;
     border-collapse: collapse;
     margin: 10px 0;
@@ -400,28 +437,50 @@
     border-radius: 10px;
     overflow: hidden;
   }
-
-  .bubble th {
-    background: var(--surface2);
-    border-bottom: 1px solid var(--border-hi);
+  .msg.assistant .bubble th {
+    background: rgba(0,0,0,0.20);
+    border-bottom: 1px solid rgba(255,255,255,0.15);
     padding: 8px 12px;
-    font-weight: 500;
+    font-weight: 600;
     text-align: left;
     font-size: 12px;
-    color: var(--text-2);
+    color: rgba(255,255,255,0.80);
     letter-spacing: 0.02em;
   }
-
-  .bubble td {
-    border-bottom: 1px solid var(--border);
+  .msg.assistant .bubble td {
+    border-bottom: 1px solid rgba(255,255,255,0.08);
     padding: 8px 12px;
-    color: var(--text-2);
+    color: rgba(255,255,255,0.88);
   }
+  .msg.assistant .bubble tr:last-child td { border-bottom: none; }
+  .msg.assistant .bubble tr:hover td { background: rgba(255,255,255,0.06); }
 
-  .bubble tr:last-child td { border-bottom: none; }
-  .bubble tr:hover td { background: rgba(255,255,255,0.02); }
+  /* Tabelle — utente */
+  .msg.user .bubble table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0;
+    font-size: 13px;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .msg.user .bubble th {
+    background: rgba(0,0,30,0.10);
+    border-bottom: 1px solid rgba(0,0,50,0.15);
+    padding: 8px 12px;
+    font-weight: 600;
+    text-align: left;
+    font-size: 12px;
+    color: #2a2a50;
+  }
+  .msg.user .bubble td {
+    border-bottom: 1px solid rgba(0,0,30,0.08);
+    padding: 8px 12px;
+    color: #1a1a3a;
+  }
+  .msg.user .bubble tr:last-child td { border-bottom: none; }
 
-  /* Typing */
+  /* Typing — bolla viola come Manphix */
   .typing-msg {
     display: flex;
     align-items: flex-start;
@@ -433,22 +492,27 @@
   .typing-dots {
     display: flex;
     align-items: center;
-    gap: 4px;
-    padding: 14px 4px;
+    gap: 5px;
+    padding: 12px 16px;
+    background: linear-gradient(145deg,
+      #c4b5fd 0%, #8b5cf6 22%, #5b21b6 48%, #7c3aed 74%, #a78bfa 100%
+    );
+    border-radius: 18px 18px 18px 4px;
+    box-shadow: 0 2px 16px rgba(109,40,217,0.30), inset 0 1px 0 rgba(255,255,255,0.18);
   }
 
   .typing-dot {
     width: 5px; height: 5px;
     border-radius: 50%;
-    background: var(--text-2);
+    background: rgba(255,255,255,0.80);
     animation: typingWave 1.3s ease-in-out infinite;
   }
   .typing-dot:nth-child(2) { animation-delay: 0.18s; }
   .typing-dot:nth-child(3) { animation-delay: 0.36s; }
 
   @keyframes typingWave {
-    0%,58%,100% { transform: translateY(0); opacity: 0.25; }
-    29% { transform: translateY(-5px); opacity: 0.9; }
+    0%,58%,100% { transform: translateY(0); opacity: 0.35; }
+    29% { transform: translateY(-5px); opacity: 1; }
   }
 
   /* Input bar */
@@ -540,7 +604,7 @@
     .messages-inner, .input-row { max-width: 100%; }
     .input-bar { padding: 8px 12px 14px; }
     .messages-wrap { padding: 12px 0 6px; }
-    .msg.user .bubble { max-width: 86%; }
+    .msg.user .bubble, .msg.assistant .bubble { max-width: 86%; }
     .topbar { padding: 0 12px; }
   }
 
