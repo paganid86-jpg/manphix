@@ -320,13 +320,14 @@ Domanda: {message}"""
         except:
             pass
 
-    # 5. Gestione file allegato — costruisce content blocks e testo per il DB
-    content_blocks: List[dict] = []
-    db_message = text_message  # versione testo-only per il database
+    # 5. Gestione file allegato
+    db_message = text_message
+    message_content = text_message  # default: stringa semplice come nell'originale
 
     if file and file.filename:
         file_bytes = await file.read()
         mime = file.content_type or ""
+        content_blocks: List[dict] = []
 
         if mime in SUPPORTED_IMAGE_TYPES:
             b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
@@ -350,11 +351,12 @@ Domanda: {message}"""
             text_message = f"[File: {file.filename}]\n```\n{file_text}\n```\n\n{text_message}".strip()
             db_message = text_message
 
-    content_blocks.append({"type": "text", "text": text_message or "Analizza questo contenuto."})
+        content_blocks.append({"type": "text", "text": text_message or "Analizza questo contenuto."})
+        message_content = content_blocks  # lista di blocchi solo se c'è un file
 
     # 6. Salva nel DB (testo, senza base64) e aggiungi alla history per la chiamata API
     await save_message(session_id, "user", db_message)
-    history.append({"role": "user", "content": content_blocks})
+    history.append({"role": "user", "content": message_content})
 
     # 7. Costruisci prompt arricchito con tutti e 3 i livelli di memoria
     enriched_prompt = SYSTEM_PROMPT
