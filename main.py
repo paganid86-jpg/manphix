@@ -365,14 +365,16 @@ Domanda: {message}"""
         enriched_prompt += f"\n\n### MEMORIA CONVERSAZIONI PASSATE:\n{past_summaries}"
 
     # 8. Generazione risposta
-    response = anthropic_client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        system=enriched_prompt,
-        messages=history,
-    )
-
-    risposta = response.content[0].text
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=enriched_prompt,
+            messages=history,
+        )
+        risposta = response.content[0].text
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Anthropic API error: {str(e)}")
 
     # 9. Salva risposta di Manphix nel DB
     await save_message(session_id, "assistant", risposta)
