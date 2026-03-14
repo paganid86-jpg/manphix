@@ -11,7 +11,8 @@ import httpx
 import asyncpg
 import uuid
 import base64
-from typing import List, Dict, Optional
+import time
+from typing import List, Dict, Optional, Any
 from contextlib import asynccontextmanager
 
 # --- CONFIGURAZIONE DATABASE ---
@@ -104,7 +105,8 @@ AVAILABLE_MODELS = {
     },
 }
 
-async def get_ai_response(messages: List[Dict], model_key: str, system_prompt: str) -> str:
+async def get_ai_response(messages: List[Dict], model_key: str, system_prompt: str) -> Dict[str, Any]:
+    """Restituisce {text, tokens_in, tokens_out} con dati reali di utilizzo dall'API."""
     cfg = AVAILABLE_MODELS.get(model_key, AVAILABLE_MODELS["haiku"])
     provider = cfg["provider"]
     model_id = cfg["model_id"]
@@ -117,7 +119,11 @@ async def get_ai_response(messages: List[Dict], model_key: str, system_prompt: s
                 system=system_prompt,
                 messages=messages,
             )
-            return response.content[0].text
+            return {
+                "text": response.content[0].text,
+                "tokens_in": response.usage.input_tokens,
+                "tokens_out": response.usage.output_tokens,
+            }
         except Exception as e:
             raise Exception(f"Anthropic error: {str(e)}")
 
@@ -138,7 +144,12 @@ async def get_ai_response(messages: List[Dict], model_key: str, system_prompt: s
                 messages=groq_messages,
                 max_tokens=1024,
             )
-            return response.choices[0].message.content
+            usage = response.usage
+            return {
+                "text": response.choices[0].message.content,
+                "tokens_in": usage.prompt_tokens if usage else 0,
+                "tokens_out": usage.completion_tokens if usage else 0,
+            }
         except Exception as e:
             raise Exception(f"Groq error: {str(e)}")
 
@@ -197,6 +208,7 @@ class LoginRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+    usage: Optional[Dict[str, Any]] = None
 
 # --- FUNZIONI DB ---
 
@@ -455,11 +467,15 @@ Domanda: {message}"""
     if past_summaries:
         enriched_prompt += f"\n\n### MEMORIA CONVERSAZIONI PASSATE:\n{past_summaries}"
 
-    # 8. Generazione risposta
+    # 8. Generazione risposta — misura latenza reale
     try:
-        risposta = await get_ai_response(history, model, enriched_prompt)
+        t_start = time.time()
+        result = await get_ai_response(history, model, enriched_prompt)
+        latency_ms = int((time.time() - t_start) * 1000)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    risposta = result["text"]
 
     # 9. Salva risposta di Manphix nel DB
     await save_message(session_id, "assistant", risposta)
@@ -470,7 +486,14 @@ Domanda: {message}"""
         history.append({"role": "assistant", "content": risposta})
         await generate_and_save_summary(session_id, history, total_messages)
 
-    return ChatResponse(response=risposta)
+    return ChatResponse(
+        response=risposta,
+        usage={
+            "tokens_in": result.get("tokens_in", 0),
+            "tokens_out": result.get("tokens_out", 0),
+            "latency_ms": latency_ms,
+        }
+    )
 
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):

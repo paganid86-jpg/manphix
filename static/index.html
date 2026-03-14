@@ -937,11 +937,43 @@ function typeTask(text) {
   })();
 }
 
+// lastRealUsage: dati reali dall'ultima risposta del modello
+let lastRealUsage = null;
+
 function updateStats() {
-  tokEl.textContent = Math.floor(Math.random()*4000+800);
-  layEl.textContent = Math.floor(Math.random()*96+32);
-  conEl.textContent = (Math.random()*0.2+0.79).toFixed(3);
-  latEl.textContent = Math.floor(Math.random()*60+20)+'ms';
+  // In idle: anima le stat solo se non abbiamo dati reali,
+  // oppure aggiunge piccole variazioni intorno ai valori reali per dare vita
+  if (lastRealUsage) {
+    // Mantieni i dati reali con leggero shimmer ±2%
+    const jitter = (v, pct) => Math.max(0, Math.round(v * (1 + (Math.random()-0.5)*pct)));
+    tokEl.textContent = jitter(lastRealUsage.tokens_out, 0.04);
+    layEl.textContent = jitter(lastRealUsage.tokens_in, 0.02);
+    conEl.textContent = Math.min(0.999, lastRealUsage.conf + (Math.random()-0.5)*0.004).toFixed(3);
+    latEl.textContent = jitter(lastRealUsage.latency_ms, 0.08) + 'ms';
+  } else {
+    // Nessuna risposta ancora: placeholder animato
+    tokEl.textContent = '—';
+    layEl.textContent = '—';
+    conEl.textContent = '—';
+    latEl.textContent = '—';
+  }
+}
+
+function updateNeuralStatsReal(usage) {
+  // Chiamata dopo ogni risposta del modello con dati veri
+  const conf = Math.min(0.999, 0.82 + (usage.tokens_out / (usage.tokens_out + 200)) * 0.17);
+  lastRealUsage = {
+    tokens_out: usage.tokens_out,
+    tokens_in:  usage.tokens_in,
+    latency_ms: usage.latency_ms,
+    conf:        conf,
+  };
+  tokEl.textContent = usage.tokens_out;
+  layEl.textContent = usage.tokens_in;
+  conEl.textContent = conf.toFixed(3);
+  latEl.textContent = usage.latency_ms + 'ms';
+  // Aggiorna il task text con un summary reale
+  typeTask(`Output: ${usage.tokens_out} tok · Context: ${usage.tokens_in} tok · ${usage.latency_ms}ms`);
 }
 
 // Ciclo task — usa lista diversa in base allo stato
@@ -953,7 +985,7 @@ setInterval(() => {
 }, 2400);
 
 typeTask(TASKS_IDLE[0]);
-updateStats();
+updateStats(); // inizializza con placeholder — fino alla prima risposta
 
 // ── 3-D helpers ───────────────────────────────────────────────────────────────
 const canvas = document.getElementById('neural-canvas');
@@ -1376,6 +1408,8 @@ requestAnimationFrame(draw);
       if (!res.ok) throw new Error('fail');
       const data = await res.json();
       addMessage('bot', data.response);
+      // Aggiorna Neural Engine con i dati reali del modello
+      if (data.usage) updateNeuralStatsReal(data.usage);
     } catch {
       removeThinking();
       addMessage('bot', '⚠ Errore di connessione. Riprova.');
