@@ -731,6 +731,72 @@
     margin-bottom: 8px;
   }
 
+  /* ── Model selector ── */
+  .model-selector {
+    border-top: 1px solid rgba(180, 80, 255, 0.10);
+    background: rgba(8, 2, 14, 0.70);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    padding: 7px 16px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    overflow-x: auto;
+    flex-shrink: 0;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .model-selector::-webkit-scrollbar { display: none; }
+
+  .model-selector-label {
+    font-family: var(--mono);
+    font-size: 0.55rem;
+    letter-spacing: 0.22em;
+    color: var(--text-lo);
+    text-transform: uppercase;
+    flex-shrink: 0;
+    padding-right: 2px;
+  }
+
+  .model-pill {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 13px;
+    border-radius: 20px;
+    border: 1px solid rgba(180, 80, 255, 0.13);
+    background: rgba(140, 0, 255, 0.05);
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 0.60rem;
+    letter-spacing: 0.09em;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: all 0.26s var(--ease);
+  }
+  .model-pill:hover {
+    border-color: rgba(180, 80, 255, 0.30);
+    color: var(--accent3);
+    background: rgba(140, 0, 255, 0.10);
+  }
+  .model-pill.active {
+    background: linear-gradient(135deg, rgba(140, 0, 255, 0.28), rgba(90, 0, 180, 0.38));
+    border-color: rgba(180, 80, 255, 0.48);
+    color: #fff;
+    box-shadow: 0 0 14px rgba(140, 0, 255, 0.18);
+  }
+
+  .system-msg {
+    text-align: center;
+    font-family: var(--mono);
+    font-size: 0.62rem;
+    letter-spacing: 0.12em;
+    color: rgba(180, 80, 255, 0.42);
+    padding: 2px 0 4px;
+    animation: msgIn 0.4s var(--ease);
+  }
+
   /* Responsive */
   @media (max-width: 768px) {
     .app-grid { grid-template-columns: 1fr; grid-template-rows: 52px 1fr; }
@@ -808,6 +874,11 @@
             <span class="topic-tag" onclick="quickAsk('Trend podcast italiani')">Podcast</span>
           </div>
         </div>
+      </div>
+
+      <!-- Model selector -->
+      <div class="model-selector" id="model-selector">
+        <span class="model-selector-label">Model</span>
       </div>
 
       <div class="input-area">
@@ -1095,10 +1166,57 @@ requestAnimationFrame(draw);
 ══════════════════════════════════════════════════════════════════════════ -->
 <script>
   let sessionId = null;
+  let currentModel = 'haiku';
 
   document.getElementById('password-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') doLogin();
   });
+
+  async function fetchModels() {
+    try {
+      const res = await fetch('/api/models');
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      renderModelSelector(data.models);
+    } catch {
+      // fallback: solo haiku
+      renderModelSelector([{ key: 'haiku', display_name: 'Claude Haiku', provider: 'anthropic' }]);
+    }
+  }
+
+  function renderModelSelector(models) {
+    const container = document.getElementById('model-selector');
+    // Rimuovi pill esistenti (mantieni label)
+    container.querySelectorAll('.model-pill').forEach(el => el.remove());
+    const providerIcon = { anthropic: '🟣', groq: '🟢' };
+    models.forEach(m => {
+      const pill = document.createElement('button');
+      pill.className = 'model-pill' + (m.key === currentModel ? ' active' : '');
+      pill.dataset.key = m.key;
+      pill.title = m.description || '';
+      pill.innerHTML = `${providerIcon[m.provider] || '⚪'} ${m.display_name}`;
+      pill.onclick = () => selectModel(m.key, m.display_name);
+      container.appendChild(pill);
+    });
+  }
+
+  function selectModel(key, displayName) {
+    if (key === currentModel) return;
+    currentModel = key;
+    document.querySelectorAll('.model-pill').forEach(p => {
+      p.classList.toggle('active', p.dataset.key === key);
+    });
+    addSystemMsg(`⚡ Modello cambiato a: ${displayName}`);
+  }
+
+  function addSystemMsg(text) {
+    const msgs = document.getElementById('messages');
+    const div = document.createElement('div');
+    div.className = 'system-msg';
+    div.textContent = text;
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+  }
 
   async function doLogin() {
     const pwd = document.getElementById('password-input').value;
@@ -1116,6 +1234,7 @@ requestAnimationFrame(draw);
       document.getElementById('login-screen').style.display = 'none';
       document.getElementById('app').style.display = 'block';
       document.getElementById('user-input').focus();
+      await fetchModels();
     } catch { err.style.display = 'block'; }
   }
 
@@ -1247,6 +1366,7 @@ requestAnimationFrame(draw);
     const fd = new FormData();
     fd.append('session_id', sessionId);
     fd.append('message', text || '');
+    fd.append('model', currentModel);
     if (pendingFile) fd.append('file', pendingFile);
     removeAttachment();
 

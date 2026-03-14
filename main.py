@@ -4,6 +4,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import anthropic
+import groq as groq_sdk
 from tavily import TavilyClient
 import os
 import httpx
@@ -73,7 +74,76 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 ACCESS_PASSWORD = os.environ.get("MANPHIX_PASSWORD", "manphix2024")
 anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+groq_client = groq_sdk.Groq(api_key=os.environ.get("GROQ_API_KEY")) if os.environ.get("GROQ_API_KEY") else None
 tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
+
+AVAILABLE_MODELS = {
+    "haiku": {
+        "provider": "anthropic",
+        "model_id": "claude-haiku-4-5-20251001",
+        "display_name": "Claude Haiku",
+        "description": "Veloce e preciso (Anthropic)"
+    },
+    "llama-70b": {
+        "provider": "groq",
+        "model_id": "llama-3.3-70b-versatile",
+        "display_name": "Llama 3.3 70B",
+        "description": "Potente e versatile (Groq)"
+    },
+    "llama-8b": {
+        "provider": "groq",
+        "model_id": "llama-3.1-8b-instant",
+        "display_name": "Llama 3.1 8B",
+        "description": "Ultra veloce (Groq)"
+    },
+    "deepseek-r1": {
+        "provider": "groq",
+        "model_id": "deepseek-r1-distill-llama-70b",
+        "display_name": "DeepSeek R1",
+        "description": "Reasoning avanzato (Groq)"
+    },
+}
+
+async def get_ai_response(messages: List[Dict], model_key: str, system_prompt: str) -> str:
+    cfg = AVAILABLE_MODELS.get(model_key, AVAILABLE_MODELS["haiku"])
+    provider = cfg["provider"]
+    model_id = cfg["model_id"]
+
+    if provider == "anthropic":
+        try:
+            response = anthropic_client.messages.create(
+                model=model_id,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=messages,
+            )
+            return response.content[0].text
+        except Exception as e:
+            raise Exception(f"Anthropic error: {str(e)}")
+
+    elif provider == "groq":
+        if not groq_client:
+            raise Exception("GROQ_API_KEY non configurata")
+        try:
+            groq_messages = [{"role": "system", "content": system_prompt}]
+            for msg in messages:
+                content = msg["content"]
+                if isinstance(content, list):
+                    # Estrai solo le parti testuali dai content blocks (immagini/PDF non supportati da Groq)
+                    text_parts = [b["text"] for b in content if b.get("type") == "text"]
+                    content = "\n".join(text_parts) or "(contenuto non testuale)"
+                groq_messages.append({"role": msg["role"], "content": content})
+            response = groq_client.chat.completions.create(
+                model=model_id,
+                messages=groq_messages,
+                max_tokens=1024,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            raise Exception(f"Groq error: {str(e)}")
+
+    else:
+        raise Exception(f"Provider sconosciuto: {provider}")
 
 SYSTEM_PROMPT = """Sei Manphix, un assistente informativo autorevole, pacato e cordiale, con un pizzico 
 di sarcasmo e humor giovanile. Non sei un chatbot generico — sei uno specialista con 
@@ -257,6 +327,26 @@ async def get_all_learnings():
 async def root():
     return FileResponse("static/index.html")
 
+@app.get("/api/models")
+async def get_models():
+    available = []
+    for key, cfg in AVAILABLE_MODELS.items():
+        if cfg["provider"] == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
+            available.append({
+                "key": key,
+                "display_name": cfg["display_name"],
+                "description": cfg["description"],
+                "provider": cfg["provider"],
+            })
+        elif cfg["provider"] == "groq" and os.environ.get("GROQ_API_KEY"):
+            available.append({
+                "key": key,
+                "display_name": cfg["display_name"],
+                "description": cfg["description"],
+                "provider": cfg["provider"],
+            })
+    return {"models": available}
+
 @app.post("/login")
 async def login(req: LoginRequest):
     if req.password != ACCESS_PASSWORD:
@@ -269,6 +359,7 @@ async def login(req: LoginRequest):
 async def chat(
     session_id: str = Form(...),
     message: str = Form(default=""),
+    model: str = Form(default="haiku"),
     file: Optional[UploadFile] = File(default=None),
 ):
     if not await session_exists(session_id):
@@ -366,15 +457,9 @@ Domanda: {message}"""
 
     # 8. Generazione risposta
     try:
-        response = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            system=enriched_prompt,
-            messages=history,
-        )
-        risposta = response.content[0].text
+        risposta = await get_ai_response(history, model, enriched_prompt)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Anthropic API error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     # 9. Salva risposta di Manphix nel DB
     await save_message(session_id, "assistant", risposta)
