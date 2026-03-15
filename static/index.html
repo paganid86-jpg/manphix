@@ -866,8 +866,38 @@
       removeThinking();
 
       if (!res.ok) throw new Error('Request failed');
-      const data = await res.json();
-      addMessage('bot', data.response);
+
+      // SSE streaming response
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let botText = '';
+      let botDiv = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+        for (const part of parts) {
+          if (!part.startsWith('data: ')) continue;
+          let event;
+          try { event = JSON.parse(part.slice(6)); } catch { continue; }
+          if (event.type === 'delta') {
+            botText += event.text;
+            if (!botDiv) {
+              botDiv = addMessage('bot', botText);
+            } else {
+              botDiv.querySelector('.msg-content').innerHTML = formatMessage(botText);
+              const msgs = document.getElementById('messages');
+              msgs.scrollTop = msgs.scrollHeight;
+            }
+          } else if (event.type === 'error') {
+            addMessage('bot', '⚠ ' + (event.message || 'Errore del server.'));
+          }
+        }
+      }
     } catch {
       removeThinking();
       addMessage('bot', '⚠ Errore di connessione. Riprova.');
