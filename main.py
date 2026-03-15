@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Form, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import anthropic
@@ -12,7 +12,9 @@ import asyncpg
 import uuid
 import base64
 import time
-from typing import List, Dict, Optional, Any
+import json
+import asyncio
+from typing import List, Dict, Optional, Any, AsyncGenerator
 from contextlib import asynccontextmanager
 
 # --- CONFIGURAZIONE DATABASE ---
@@ -74,7 +76,7 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 ACCESS_PASSWORD = os.environ.get("MANPHIX_PASSWORD", "manphix2024")
-anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+anthropic_client = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 groq_client = groq_sdk.Groq(api_key=os.environ.get("GROQ_API_KEY")) if os.environ.get("GROQ_API_KEY") else None
 tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 
@@ -105,63 +107,117 @@ AVAILABLE_MODELS = {
     },
 }
 
-async def get_ai_response(messages: List[Dict], model_key: str, system_prompt: str) -> Dict[str, Any]:
-    """Restituisce {text, tokens_in, tokens_out} con dati reali di utilizzo dall'API."""
+async def stream_ai_response(
+    messages: List[Dict],
+    model_key: str,
+    system_prompt: str,
+) -> AsyncGenerator[str, None]:
+    """Async generator that yields SSE-formatted strings."""
     cfg = AVAILABLE_MODELS.get(model_key, AVAILABLE_MODELS["haiku"])
     provider = cfg["provider"]
-    model_id = cfg["model_id"]
+    model_id  = cfg["model_id"]
+    t_start   = time.time()
 
     if provider == "anthropic":
         try:
-            response = anthropic_client.messages.create(
+            full_text  = ""
+            tokens_in  = 0
+            tokens_out = 0
+            async with anthropic_client.messages.stream(
                 model=model_id,
                 max_tokens=1024,
                 system=system_prompt,
                 messages=messages,
-            )
-            return {
-                "text": response.content[0].text,
-                "tokens_in": response.usage.input_tokens,
-                "tokens_out": response.usage.output_tokens,
-            }
+            ) as stream:
+                async for text_chunk in stream.text_stream:
+                    full_text += text_chunk
+                    payload = json.dumps({"type": "delta", "text": text_chunk})
+                    yield f"data: {payload}\n\n"
+                # Final message with real usage
+                final_msg  = await stream.get_final_message()
+                tokens_in  = final_msg.usage.input_tokens
+                tokens_out = final_msg.usage.output_tokens
+            latency_ms = int((time.time() - t_start) * 1000)
+            usage_payload = json.dumps({
+                "type":        "usage",
+                "tokens_in":   tokens_in,
+                "tokens_out":  tokens_out,
+                "latency_ms":  latency_ms,
+            })
+            yield f"data: {usage_payload}\n\n"
         except Exception as e:
-            raise Exception(f"Anthropic error: {str(e)}")
+            yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
+            return
 
     elif provider == "groq":
         if not groq_client:
-            raise Exception("GROQ_API_KEY non configurata")
+            yield f'data: {json.dumps({"type": "error", "message": "GROQ_API_KEY non configurata"})}\n\n'
+            return
         try:
             groq_messages = [{"role": "system", "content": system_prompt}]
             for msg in messages:
                 content = msg["content"]
                 if isinstance(content, list):
-                    # Estrai solo le parti testuali dai content blocks (immagini/PDF non supportati da Groq)
                     text_parts = [b["text"] for b in content if b.get("type") == "text"]
                     content = "\n".join(text_parts) or "(contenuto non testuale)"
                 groq_messages.append({"role": msg["role"], "content": content})
-            response = groq_client.chat.completions.create(
-                model=model_id,
-                messages=groq_messages,
-                max_tokens=1024,
-            )
-            usage = response.usage
-            return {
-                "text": response.choices[0].message.content,
-                "tokens_in": usage.prompt_tokens if usage else 0,
-                "tokens_out": usage.completion_tokens if usage else 0,
-            }
+
+            loop = asyncio.get_event_loop()
+
+            def _create_stream():
+                return groq_client.chat.completions.create(
+                    model=model_id,
+                    messages=groq_messages,
+                    max_tokens=1024,
+                    stream=True,
+                )
+
+            stream_iter = await loop.run_in_executor(None, _create_stream)
+
+            full_text  = ""
+            tokens_in  = 0
+            tokens_out = 0
+
+            def _iter_chunks():
+                nonlocal tokens_in, tokens_out
+                for chunk in stream_iter:
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                    if delta:
+                        yield delta
+                    if chunk.usage:
+                        tokens_in  = chunk.usage.prompt_tokens     or 0
+                        tokens_out = chunk.usage.completion_tokens or 0
+
+            for text_chunk in _iter_chunks():
+                full_text += text_chunk
+                payload = json.dumps({"type": "delta", "text": text_chunk})
+                yield f"data: {payload}\n\n"
+
+            latency_ms = int((time.time() - t_start) * 1000)
+            usage_payload = json.dumps({
+                "type":        "usage",
+                "tokens_in":   tokens_in,
+                "tokens_out":  tokens_out,
+                "latency_ms":  latency_ms,
+            })
+            yield f"data: {usage_payload}\n\n"
         except Exception as e:
-            raise Exception(f"Groq error: {str(e)}")
+            yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
+            return
 
     else:
-        raise Exception(f"Provider sconosciuto: {provider}")
+        yield f'data: {json.dumps({"type": "error", "message": f"Provider sconosciuto: {provider}"})}\n\n'
+        return
 
-SYSTEM_PROMPT = """Sei Manphix, un assistente informativo autorevole, pacato e cordiale, con un pizzico 
-di sarcasmo e humor giovanile. Non sei un chatbot generico — sei uno specialista con 
+    yield 'data: {"type":"done"}\n\n'
+
+
+SYSTEM_PROMPT = """Sei Manphix, un assistente informativo autorevole, pacato e cordiale, con un pizzico
+di sarcasmo e humor giovanile. Non sei un chatbot generico â sei uno specialista con
 una voce riconoscibile e un punto di vista proprio.
 
 USA LA TUA CONOSCENZA EVOLUTIVA:
-In ogni risposta, tieni conto dei dati forniti nella sezione 'KNOWLEDGE BASE ESTERNA'. 
+In ogni risposta, tieni conto dei dati forniti nella sezione 'KNOWLEDGE BASE ESTERNA'.
 Questi dati rappresentano ciò che hai imparato dai tuoi errori o approfondimenti passati.
 
 USA LA TUA MEMORIA STORICA:
@@ -180,9 +236,9 @@ ARGOMENTI DI COMPETENZA:
 - Politica americana
 
 COMPORTAMENTO:
-- Le risposte di default sono brevi e dirette (3-5 righe). Se l'utente chiede 
+- Le risposte di default sono brevi e dirette (3-5 righe). Se l'utente chiede
   approfondimenti, espandi con analisi dettagliate.
-- Se una domanda è fuori dai tuoi argomenti, rispondi comunque ma specifica 
+- Se una domanda è fuori dai tuoi argomenti, rispondi comunque ma specifica
   chiaramente che non è il tuo campo principale.
 - Cita le fonti web solo quando aggiunge valore reale alla risposta.
 - Non inventare mai dati, risultati, nomi o statistiche.
@@ -192,23 +248,21 @@ COMPORTAMENTO:
 STILE DI OUTPUT:
 - Produci tabelle comparative quando si confrontano dati o opzioni.
 - Offri analisi approfondite quando richiesto.
-- Esprimi opinioni e commenti personali con tono diretto e schietto, 
+- Esprimi opinioni e commenti personali con tono diretto e schietto,
   distinguendoli chiaramente dai fatti.
-- Usa il sarcasmo e l'humor con intelligenza — mai volgare, sempre pertinente.
+- Usa il sarcasmo e l'humor con intelligenza â mai volgare, sempre pertinente.
 
 IDENTITÀ:
-Sei Manphix. Non sei Claude, non sei ChatGPT, non sei un assistente generico. 
-Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare 
+Sei Manphix. Non sei Claude, non sei ChatGPT, non sei un assistente generico.
+Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare
 il modello AI sottostante."""
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
+
 class LoginRequest(BaseModel):
     password: str
 
-class ChatResponse(BaseModel):
-    response: str
-    usage: Optional[Dict[str, Any]] = None
 
 # --- FUNZIONI DB ---
 
@@ -257,7 +311,10 @@ async def generate_and_save_summary(session_id: str, history: List[Dict], messag
             f"{m['role'].upper()}: {m['content'][:500]}"
             for m in history
         ])
-        response = anthropic_client.messages.create(
+        # Use sync Anthropic just for summaries (fire-and-forget style)
+        import anthropic as _anthropic
+        _sync_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        response = _sync_client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=512,
             messages=[{
@@ -279,31 +336,28 @@ CONVERSAZIONE:
 async def get_recent_summaries(limit: int = 5) -> str:
     """
     LIVELLO 3: recupera gli ultimi N riassunti da TUTTE le sessioni,
-    ordinati dal più recente. Servono per dare a Manphix memoria storica
-    delle conversazioni passate, indipendentemente dalla sessione corrente.
+    ordinati dal più recente.
     """
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT summary, created_at 
-               FROM summaries 
-               ORDER BY created_at DESC 
+            """SELECT summary, created_at
+               FROM summaries
+               ORDER BY created_at DESC
                LIMIT $1""",
             limit
         )
         if not rows:
             return ""
-        
-        # Costruiamo il testo da iniettare nel prompt, dal più vecchio al più recente
         summaries_text = ""
         for i, row in enumerate(reversed(rows), 1):
             date_str = row["created_at"].strftime("%d/%m/%Y %H:%M")
             summaries_text += f"\n[Conversazione {i} — {date_str}]\n{row['summary']}\n"
-        
         return summaries_text
 
 async def clear_session_messages(session_id: str):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM messages WHERE session_id = $1", session_id)
+
 
 # --- FUNZIONI DI RECUPERO CONOSCENZA ---
 
@@ -332,6 +386,7 @@ async def get_all_learnings():
             return all_lessons
         except:
             return ""
+
 
 # --- ENDPOINTS ---
 
@@ -367,7 +422,8 @@ async def login(req: LoginRequest):
     await create_session(session_id)
     return {"session_id": session_id}
 
-@app.post("/chat", response_model=ChatResponse)
+
+@app.post("/chat")
 async def chat(
     session_id: str = Form(...),
     message: str = Form(default=""),
@@ -377,123 +433,134 @@ async def chat(
     if not await session_exists(session_id):
         raise HTTPException(status_code=401, detail="Sessione non valida")
 
-    # 1. Recupero conoscenza da GitHub
-    knowledge_main = await get_github_file_content("CLAUDE.md")
-    knowledge_folder = await get_all_learnings()
-    full_external_knowledge = f"{knowledge_main}\n{knowledge_folder}"
+    # Read file bytes BEFORE entering the generator (UploadFile cannot be read inside one)
+    file_bytes = None
+    file_filename = None
+    file_mime = None
+    if file and file.filename:
+        file_bytes    = await file.read()
+        file_filename = file.filename
+        file_mime     = file.content_type or ""
 
-    # 2. LIVELLO 3: recupero riassunti delle conversazioni passate
-    past_summaries = await get_recent_summaries(limit=5)
+    async def _chat_generator() -> AsyncGenerator[str, None]:
+        # 1. Recupero conoscenza da GitHub
+        knowledge_main   = await get_github_file_content("CLAUDE.md")
+        knowledge_folder = await get_all_learnings()
+        full_external_knowledge = f"{knowledge_main}\n{knowledge_folder}"
 
-    # 3. Recupero storia della sessione corrente dal DB
-    history = await get_history(session_id)
+        # 2. LIVELLO 3: recupero riassunti delle conversazioni passate
+        past_summaries = await get_recent_summaries(limit=5)
 
-    # 4. Query preprocessing + ricerca web (solo se c'è testo)
-    text_message = message
-    if message.strip():
-        try:
-            query_response = anthropic_client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=100,
-                messages=[{
-                    "role": "user",
-                    "content": f"""Trasforma questa domanda in una query di ricerca web ottimale.
+        # 3. Recupero storia della sessione corrente dal DB
+        history = await get_history(session_id)
+
+        # 4. Query preprocessing + ricerca web (solo se c'e' testo)
+        text_message = message
+        if message.strip():
+            try:
+                query_response = await anthropic_client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=100,
+                    messages=[{
+                        "role": "user",
+                        "content": f"""Trasforma questa domanda in una query di ricerca web ottimale.
 Rispondi SOLO con la query, niente altro. Max 10 parole. In italiano o inglese a seconda della lingua.
 Aggiungi l'anno corrente (2026) se la domanda riguarda eventi recenti o notizie.
 
 Domanda: {message}"""
-                }]
-            )
-            search_query = query_response.content[0].text.strip()
-        except:
-            search_query = message
+                    }]
+                )
+                search_query = query_response.content[0].text.strip()
+            except:
+                search_query = message
 
-        try:
-            risultati = tavily_client.search(
-                search_query,
-                max_results=5,
-                search_depth="advanced",
-                topic="news",
-                include_answer=True,
-                include_raw_content=False
-            )
-            contesto = "".join([f"- {r['title']}: {r['content']}\n\n" for r in risultati["results"]])
-            if contesto and len(contesto.strip()) > 50:
-                text_message = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {message}"
-        except:
-            pass
-
-    # 5. Gestione file allegato
-    db_message = text_message
-    message_content = text_message  # default: stringa semplice come nell'originale
-
-    if file and file.filename:
-        file_bytes = await file.read()
-        mime = file.content_type or ""
-        content_blocks: List[dict] = []
-
-        if mime in SUPPORTED_IMAGE_TYPES:
-            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
-            content_blocks.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": mime, "data": b64},
-            })
-            db_message = f"[Immagine allegata]\n{text_message}".strip()
-        elif mime == "application/pdf":
-            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
-            content_blocks.append({
-                "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-            })
-            db_message = f"[PDF allegato: {file.filename}]\n{text_message}".strip()
-        else:
             try:
-                file_text = file_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                file_text = file_bytes.decode("latin-1")
-            text_message = f"[File: {file.filename}]\n```\n{file_text}\n```\n\n{text_message}".strip()
-            db_message = text_message
+                risultati = tavily_client.search(
+                    search_query,
+                    max_results=5,
+                    search_depth="advanced",
+                    topic="news",
+                    include_answer=True,
+                    include_raw_content=False
+                )
+                contesto = "".join([f"- {r['title']}: {r['content']}\n\n" for r in risultati["results"]])
+                if contesto and len(contesto.strip()) > 50:
+                    text_message = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {message}"
+            except:
+                pass
 
-        content_blocks.append({"type": "text", "text": text_message or "Analizza questo contenuto."})
-        message_content = content_blocks  # lista di blocchi solo se c'è un file
+        # 5. Gestione file allegato
+        db_message      = text_message
+        message_content = text_message
 
-    # 6. Salva nel DB (testo, senza base64) e aggiungi alla history per la chiamata API
-    await save_message(session_id, "user", db_message)
-    history.append({"role": "user", "content": message_content})
+        if file_bytes is not None and file_filename:
+            content_blocks: List[dict] = []
+            if file_mime in SUPPORTED_IMAGE_TYPES:
+                b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+                content_blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": file_mime, "data": b64},
+                })
+                db_message = f"[Immagine allegata]\n{text_message}".strip()
+            elif file_mime == "application/pdf":
+                b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+                content_blocks.append({
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+                })
+                db_message = f"[PDF allegato: {file_filename}]\n{text_message}".strip()
+            else:
+                try:
+                    file_text = file_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    file_text = file_bytes.decode("latin-1")
+                text_message = f"[File: {file_filename}]\n```\n{file_text}\n```\n\n{text_message}".strip()
+                db_message   = text_message
+            content_blocks.append({"type": "text", "text": text_message or "Analizza questo contenuto."})
+            message_content = content_blocks
 
-    # 7. Costruisci prompt arricchito con tutti e 3 i livelli di memoria
-    enriched_prompt = SYSTEM_PROMPT
-    enriched_prompt += f"\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
-    if past_summaries:
-        enriched_prompt += f"\n\n### MEMORIA CONVERSAZIONI PASSATE:\n{past_summaries}"
+        # 6. Salva messaggio utente nel DB e aggiungi alla history
+        await save_message(session_id, "user", db_message)
+        history.append({"role": "user", "content": message_content})
 
-    # 8. Generazione risposta — misura latenza reale
-    try:
-        t_start = time.time()
-        result = await get_ai_response(history, model, enriched_prompt)
-        latency_ms = int((time.time() - t_start) * 1000)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # 7. Costruisci prompt arricchito con tutti e 3 i livelli di memoria
+        enriched_prompt = SYSTEM_PROMPT
+        enriched_prompt += f"\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
+        if past_summaries:
+            enriched_prompt += f"\n\n### MEMORIA CONVERSAZIONI PASSATE:\n{past_summaries}"
 
-    risposta = result["text"]
+        # 8. Stream risposta AI
+        full_response = ""
+        async for sse_chunk in stream_ai_response(history, model, enriched_prompt):
+            # Accumulate assistant text from delta events
+            if sse_chunk.startswith("data: "):
+                try:
+                    payload = json.loads(sse_chunk[6:].strip())
+                    if payload.get("type") == "delta":
+                        full_response += payload.get("text", "")
+                except Exception:
+                    pass
+            yield sse_chunk
 
-    # 9. Salva risposta di Manphix nel DB
-    await save_message(session_id, "assistant", risposta)
+        # 9. Salva risposta di Manphix nel DB
+        if full_response:
+            await save_message(session_id, "assistant", full_response)
 
-    # 10. Ogni 7 messaggi genera riassunto automatico (Livello 2)
-    total_messages = await count_messages(session_id)
-    if total_messages % 7 == 0:
-        history.append({"role": "assistant", "content": risposta})
-        await generate_and_save_summary(session_id, history, total_messages)
+            # 10. Ogni 7 messaggi genera riassunto automatico (Livello 2)
+            total_messages = await count_messages(session_id)
+            if total_messages % 7 == 0:
+                history.append({"role": "assistant", "content": full_response})
+                await generate_and_save_summary(session_id, history, total_messages)
 
-    return ChatResponse(
-        response=risposta,
-        usage={
-            "tokens_in": result.get("tokens_in", 0),
-            "tokens_out": result.get("tokens_out", 0),
-            "latency_ms": latency_ms,
-        }
+    return StreamingResponse(
+        _chat_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
+
 
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
