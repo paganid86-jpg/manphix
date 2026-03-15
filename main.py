@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,8 +14,18 @@ import base64
 import time
 import json
 import asyncio
+import logging
+from collections import defaultdict
 from typing import List, Dict, Optional, Any, AsyncGenerator
 from contextlib import asynccontextmanager
+
+# --- LOGGING STRUTTURATO ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("manphix")
 
 # --- CONFIGURAZIONE DATABASE ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -23,7 +33,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 db_pool = None
 
 async def init_db():
-    """Crea le tabelle se non esistono ancora"""
+    """Crea le tabelle e gli indici se non esistono ancora"""
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -49,6 +59,20 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # --- MIGLIORIA 1: indici per velocizzare le query per sessione ---
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_session_id
+            ON messages(session_id)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_summaries_session_id
+            ON summaries(session_id)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_summaries_created_at
+            ON summaries(created_at DESC)
+        """)
+        logger.info("Database inizializzato con indici")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -107,6 +131,59 @@ AVAILABLE_MODELS = {
     },
 }
 
+# --- MIGLIORIA 2: RATE LIMITING IN-MEMORY ---
+# Max 20 richieste per sessione per finestra di 60 secondi
+RATE_LIMIT_MAX = 20
+RATE_LIMIT_WINDOW = 60  # secondi
+_rate_store: Dict[str, List[float]] = defaultdict(list)
+
+def check_rate_limit(session_id: str) -> bool:
+    """
+    Ritorna True se la richiesta è consentita, False se supera il limite.
+    Implementazione sliding window.
+    """
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW
+    # Rimuove timestamp fuori dalla finestra
+    _rate_store[session_id] = [t for t in _rate_store[session_id] if t > window_start]
+    if len(_rate_store[session_id]) >= RATE_LIMIT_MAX:
+        return False
+    _rate_store[session_id].append(now)
+    return True
+
+# --- MIGLIORIA 3: VALIDAZIONE FILE SERVER-SIDE ---
+FILE_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB
+
+# Magic bytes per i tipi supportati
+_MAGIC_BYTES: Dict[bytes, str] = {
+    b"\xff\xd8\xff": "image/jpeg",
+    b"\x89PNG":      "image/png",
+    b"GIF8":         "image/gif",
+    b"RIFF":         "image/webp",   # WebP: RIFF????WEBP
+    b"%PDF":         "application/pdf",
+}
+
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+SUPPORTED_TEXT_TYPES  = {"text/plain", "text/markdown", "text/csv", "text/x-log",
+                          "application/json", "text/x-python", "application/javascript"}
+
+def validate_file(file_bytes: bytes, claimed_mime: str, filename: str) -> Optional[str]:
+    """
+    Valida dimensione e tipo del file.
+    Ritorna None se OK, altrimenti il messaggio di errore.
+    """
+    if len(file_bytes) > FILE_SIZE_LIMIT:
+        return f"File troppo grande ({len(file_bytes) // 1024 // 1024} MB). Limite: 10 MB."
+
+    # Controlla magic bytes solo per i tipi binari dichiarati
+    if claimed_mime in SUPPORTED_IMAGE_TYPES or claimed_mime == "application/pdf":
+        matched = any(file_bytes[:len(magic)] == magic for magic in _MAGIC_BYTES)
+        if not matched:
+            return f"Il tipo del file non corrisponde al contenuto effettivo ({filename})."
+
+    return None
+
+
 async def stream_ai_response(
     messages: List[Dict],
     model_key: str,
@@ -133,7 +210,6 @@ async def stream_ai_response(
                     full_text += text_chunk
                     payload = json.dumps({"type": "delta", "text": text_chunk})
                     yield f"data: {payload}\n\n"
-                # Final message with real usage
                 final_msg  = await stream.get_final_message()
                 tokens_in  = final_msg.usage.input_tokens
                 tokens_out = final_msg.usage.output_tokens
@@ -145,7 +221,16 @@ async def stream_ai_response(
                 "latency_ms":  latency_ms,
             })
             yield f"data: {usage_payload}\n\n"
+        except anthropic.RateLimitError:
+            logger.warning("Anthropic: quota esaurita")
+            yield f'data: {json.dumps({"type": "error", "message": "Quota API Anthropic esaurita. Riprova tra qualche secondo."})}\n\n'
+            return
+        except anthropic.APITimeoutError:
+            logger.error("Anthropic: timeout risposta")
+            yield f'data: {json.dumps({"type": "error", "message": "Timeout risposta Anthropic. Riprova."})}\n\n'
+            return
         except Exception as e:
+            logger.error(f"Anthropic errore generico: {e}")
             yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
             return
 
@@ -202,6 +287,7 @@ async def stream_ai_response(
             })
             yield f"data: {usage_payload}\n\n"
         except Exception as e:
+            logger.error(f"Groq errore: {e}")
             yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
             return
 
@@ -213,7 +299,7 @@ async def stream_ai_response(
 
 
 SYSTEM_PROMPT = """Sei Manphix, un assistente informativo autorevole, pacato e cordiale, con un pizzico
-di sarcasmo e humor giovanile. Non sei un chatbot generico â sei uno specialista con
+di sarcasmo e humor giovanile. Non sei un chatbot generico — sei uno specialista con
 una voce riconoscibile e un punto di vista proprio.
 
 USA LA TUA CONOSCENZA EVOLUTIVA:
@@ -250,14 +336,12 @@ STILE DI OUTPUT:
 - Offri analisi approfondite quando richiesto.
 - Esprimi opinioni e commenti personali con tono diretto e schietto,
   distinguendoli chiaramente dai fatti.
-- Usa il sarcasmo e l'humor con intelligenza â mai volgare, sempre pertinente.
+- Usa il sarcasmo e l'humor con intelligenza — mai volgare, sempre pertinente.
 
 IDENTITÀ:
 Sei Manphix. Non sei Claude, non sei ChatGPT, non sei un assistente generico.
 Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare
 il modello AI sottostante."""
-
-SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 
 class LoginRequest(BaseModel):
@@ -304,17 +388,19 @@ async def save_summary(session_id: str, summary: str, message_count: int):
             session_id, summary, message_count
         )
 
+# --- MIGLIORIA 5: generazione summaries asincrona e non-bloccante ---
 async def generate_and_save_summary(session_id: str, history: List[Dict], message_count: int):
-    """Livello 2: genera e salva riassunto ogni 7 messaggi"""
+    """
+    Livello 2: genera e salva riassunto ogni 7 messaggi.
+    Usa il client async (non più sync) — viene eseguita come fire-and-forget
+    tramite asyncio.create_task() per non bloccare lo streaming.
+    """
     try:
         conversation_text = "\n".join([
             f"{m['role'].upper()}: {m['content'][:500]}"
             for m in history
         ])
-        # Use sync Anthropic just for summaries (fire-and-forget style)
-        import anthropic as _anthropic
-        _sync_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-        response = _sync_client.messages.create(
+        response = await anthropic_client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=512,
             messages=[{
@@ -329,9 +415,9 @@ CONVERSAZIONE:
         )
         summary = response.content[0].text
         await save_summary(session_id, summary, message_count)
-        print(f"[Manphix] Riassunto salvato per sessione {session_id} dopo {message_count} messaggi")
+        logger.info(f"Riassunto salvato per sessione {session_id} ({message_count} messaggi)")
     except Exception as e:
-        print(f"[Manphix] Errore generazione riassunto: {e}")
+        logger.error(f"Errore generazione riassunto sessione {session_id}: {e}")
 
 async def get_recent_summaries(limit: int = 5) -> str:
     """
@@ -361,31 +447,49 @@ async def clear_session_messages(session_id: str):
 
 # --- FUNZIONI DI RECUPERO CONOSCENZA ---
 
-async def get_github_file_content(file_path: str):
+async def get_github_file_content(file_path: str) -> str:
     url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{file_path}"
-    async with httpx.AsyncClient() as client:
-        try:
+    # --- MIGLIORIA 4: timeout esplicito + logging ---
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers=HEADERS)
-            return resp.text if resp.status_code == 200 else ""
-        except:
+            if resp.status_code == 200:
+                return resp.text
+            logger.warning(f"GitHub file {file_path}: HTTP {resp.status_code}")
             return ""
+    except httpx.TimeoutException:
+        logger.warning(f"GitHub file {file_path}: timeout")
+        return ""
+    except Exception as e:
+        logger.error(f"GitHub file {file_path}: {e}")
+        return ""
 
-async def get_all_learnings():
+async def get_all_learnings() -> str:
     api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/.learnings"
     all_lessons = ""
-    async with httpx.AsyncClient() as client:
-        try:
+    # --- MIGLIORIA 4: timeout esplicito + logging ---
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(api_url, headers=HEADERS)
-            if resp.status_code == 200:
-                files = resp.json()
-                for file_info in files:
-                    if file_info["type"] == "file":
-                        f_resp = await client.get(file_info["download_url"])
+            if resp.status_code != 200:
+                logger.warning(f"GitHub learnings: HTTP {resp.status_code}")
+                return ""
+            files = resp.json()
+            for file_info in files:
+                if file_info["type"] == "file":
+                    try:
+                        f_resp = await client.get(file_info["download_url"], timeout=10.0)
                         if f_resp.status_code == 200:
                             all_lessons += f"\n--- Fonte: {file_info['name']} ---\n{f_resp.text}\n"
+                    except Exception as fe:
+                        logger.warning(f"GitHub learning file {file_info['name']}: {fe}")
             return all_lessons
-        except:
-            return ""
+    except httpx.TimeoutException:
+        logger.warning("GitHub learnings: timeout")
+        return ""
+    except Exception as e:
+        logger.error(f"GitHub learnings: {e}")
+        return ""
 
 
 # --- ENDPOINTS ---
@@ -420,6 +524,7 @@ async def login(req: LoginRequest):
         raise HTTPException(status_code=401, detail="Password errata")
     session_id = str(uuid.uuid4())
     await create_session(session_id)
+    logger.info(f"Nuova sessione creata: {session_id}")
     return {"session_id": session_id}
 
 
@@ -433,7 +538,15 @@ async def chat(
     if not await session_exists(session_id):
         raise HTTPException(status_code=401, detail="Sessione non valida")
 
-    # Read file bytes BEFORE entering the generator (UploadFile cannot be read inside one)
+    # --- MIGLIORIA 2: controllo rate limit ---
+    if not check_rate_limit(session_id):
+        logger.warning(f"Rate limit superato per sessione {session_id}")
+        raise HTTPException(
+            status_code=429,
+            detail=f"Troppe richieste. Limite: {RATE_LIMIT_MAX} messaggi al minuto."
+        )
+
+    # Legge il file PRIMA di entrare nel generator (UploadFile non è leggibile dentro)
     file_bytes = None
     file_filename = None
     file_mime = None
@@ -441,6 +554,11 @@ async def chat(
         file_bytes    = await file.read()
         file_filename = file.filename
         file_mime     = file.content_type or ""
+
+        # --- MIGLIORIA 3: validazione file server-side ---
+        error_msg = validate_file(file_bytes, file_mime, file_filename)
+        if error_msg:
+            raise HTTPException(status_code=400, detail=error_msg)
 
     async def _chat_generator() -> AsyncGenerator[str, None]:
         # 1. Recupero conoscenza da GitHub
@@ -454,9 +572,10 @@ async def chat(
         # 3. Recupero storia della sessione corrente dal DB
         history = await get_history(session_id)
 
-        # 4. Query preprocessing + ricerca web (solo se c'e' testo)
+        # 4. Query preprocessing + ricerca web (solo se c'è testo)
         text_message = message
         if message.strip():
+            # --- MIGLIORIA 4: logging errori query preprocessing ---
             try:
                 query_response = await anthropic_client.messages.create(
                     model="claude-haiku-4-5-20251001",
@@ -471,9 +590,14 @@ Domanda: {message}"""
                     }]
                 )
                 search_query = query_response.content[0].text.strip()
-            except:
+            except anthropic.RateLimitError:
+                logger.warning("Anthropic query preprocessing: quota esaurita, uso messaggio originale")
+                search_query = message
+            except Exception as e:
+                logger.warning(f"Anthropic query preprocessing: {e}, uso messaggio originale")
                 search_query = message
 
+            # --- MIGLIORIA 4: logging errori Tavily ---
             try:
                 risultati = tavily_client.search(
                     search_query,
@@ -486,8 +610,8 @@ Domanda: {message}"""
                 contesto = "".join([f"- {r['title']}: {r['content']}\n\n" for r in risultati["results"]])
                 if contesto and len(contesto.strip()) > 50:
                     text_message = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {message}"
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Tavily search fallita ('{search_query}'): {e}")
 
         # 5. Gestione file allegato
         db_message      = text_message
@@ -532,7 +656,6 @@ Domanda: {message}"""
         # 8. Stream risposta AI
         full_response = ""
         async for sse_chunk in stream_ai_response(history, model, enriched_prompt):
-            # Accumulate assistant text from delta events
             if sse_chunk.startswith("data: "):
                 try:
                     payload = json.loads(sse_chunk[6:].strip())
@@ -546,11 +669,14 @@ Domanda: {message}"""
         if full_response:
             await save_message(session_id, "assistant", full_response)
 
-            # 10. Ogni 7 messaggi genera riassunto automatico (Livello 2)
+            # 10. Ogni 7 messaggi genera riassunto in background (non bloccante)
+            # --- MIGLIORIA 5: asyncio.create_task() — fire-and-forget ---
             total_messages = await count_messages(session_id)
             if total_messages % 7 == 0:
                 history.append({"role": "assistant", "content": full_response})
-                await generate_and_save_summary(session_id, history, total_messages)
+                asyncio.create_task(
+                    generate_and_save_summary(session_id, history, total_messages)
+                )
 
     return StreamingResponse(
         _chat_generator(),
@@ -565,4 +691,5 @@ Domanda: {message}"""
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
     await clear_session_messages(session_id)
+    logger.info(f"Sessione {session_id} cancellata")
     return {"status": "ok"}
