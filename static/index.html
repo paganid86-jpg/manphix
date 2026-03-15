@@ -805,9 +805,96 @@
     #neural-panel { display: none; }
     #chat-column { grid-column: 1; }
   }
+
+  /* ── Toast notifications ─────────────────────────────────────────────── */
+  #toast-container {
+    position: fixed;
+    bottom: 28px;
+    right: 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 9999;
+    pointer-events: none;
+  }
+  .toast {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.07em;
+    padding: 10px 18px;
+    border-radius: 10px;
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid transparent;
+    max-width: 320px;
+    animation: toastIn 0.28s var(--ease) forwards;
+    pointer-events: auto;
+  }
+  .toast.info    { background: rgba(120,0,240,0.22); border-color: rgba(160,60,255,0.30); color: var(--accent3); }
+  .toast.success { background: rgba(0,180,80,0.18);  border-color: rgba(0,200,80,0.28);  color: #7fffc4; }
+  .toast.warning { background: rgba(255,180,0,0.15); border-color: rgba(255,200,0,0.28); color: var(--accent-gold); }
+  .toast.error   { background: rgba(255,40,80,0.18); border-color: rgba(255,60,80,0.30); color: #ff8899; }
+  .toast.out     { animation: toastOut 0.28s var(--ease) forwards; }
+  @keyframes toastIn  { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:none; } }
+  @keyframes toastOut { from { opacity:1; transform:none; } to { opacity:0; transform:translateY(8px); } }
+
+  /* ── Copy button su messaggi bot ──────────────────────────────────────── */
+  .message { position: relative; }
+  .copy-btn {
+    position: absolute;
+    top: 8px;
+    right: 10px;
+    background: rgba(120,0,240,0.10);
+    border: 1px solid rgba(160,60,255,0.18);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 0.60rem;
+    padding: 3px 8px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.18s, color 0.18s;
+    letter-spacing: 0.05em;
+  }
+  .message:hover .copy-btn { opacity: 1; }
+  .copy-btn:hover { color: var(--accent3); border-color: rgba(160,60,255,0.40); }
+  .copy-btn.copied { color: #7fffc4; border-color: rgba(0,200,80,0.35); }
+
+  /* ── Markdown: headers, link, tabelle ────────────────────────────────── */
+  .msg-content h1 { font-family: var(--sans); font-size: 1.15rem; font-weight: 700; color: var(--accent3); margin: 14px 0 6px; }
+  .msg-content h2 { font-family: var(--sans); font-size: 1.02rem; font-weight: 600; color: var(--accent3); margin: 12px 0 5px; }
+  .msg-content h3 { font-family: var(--sans); font-size: 0.92rem; font-weight: 600; color: var(--text);     margin: 10px 0 4px; }
+  .msg-content a  { color: var(--accent-cyan); text-decoration: none; border-bottom: 1px solid rgba(0,229,255,0.25); }
+  .msg-content a:hover { border-bottom-color: var(--accent-cyan); }
+  .msg-content table {
+    width: 100%; border-collapse: collapse; margin: 12px 0;
+    font-size: 0.84rem; font-family: var(--mono);
+  }
+  .msg-content th {
+    background: rgba(120,0,240,0.14); color: var(--accent3);
+    border: 1px solid rgba(160,60,255,0.15); padding: 6px 10px; text-align: left;
+  }
+  .msg-content td {
+    border: 1px solid rgba(160,60,255,0.09); padding: 5px 10px; color: var(--text);
+  }
+  .msg-content tr:nth-child(even) td { background: rgba(120,0,240,0.05); }
+  .msg-content hr { border: none; border-top: 1px solid rgba(160,60,255,0.13); margin: 12px 0; }
+
+  /* ── Banner search skipped ───────────────────────────────────────────── */
+  .search-skipped-banner {
+    font-family: var(--mono);
+    font-size: 0.62rem;
+    color: var(--accent-gold);
+    opacity: 0.68;
+    letter-spacing: 0.08em;
+    padding: 2px 0 6px;
+  }
 </style>
 </head>
 <body>
+<!-- Toast container -->
+<div id="toast-container"></div>
+
 
 <!-- ══ LOGIN ══════════════════════════════════════════════════════════════════ -->
 <div id="login-screen">
@@ -1301,10 +1388,23 @@ requestAnimationFrame(draw);
     div.className = `message ${role}`;
     const avatar = role === 'user' ? 'YOU' : 'MX';
     const imgHtml = imageDataUrl ? `<img class="msg-img" src="${imageDataUrl}" alt="attachment">` : '';
-    div.innerHTML = `<div class="msg-avatar">${avatar}</div><div class="msg-content">${imgHtml}${content ? formatMessage(content) : ''}</div>`;
+    const copyBtn = role === 'bot'
+      ? `<button class="copy-btn" onclick="copyMessage(this)" title="Copia messaggio">COPY</button>`
+      : '';
+    div.innerHTML = `${copyBtn}<div class="msg-avatar">${avatar}</div><div class="msg-content">${imgHtml}${content ? formatMessage(content) : ''}</div>`;
     msgs.appendChild(div);
     msgs.scrollTop = msgs.scrollHeight;
     return div;
+  }
+
+  function copyMessage(btn) {
+    const content = btn.closest('.message').querySelector('.msg-content');
+    const text = content ? content.innerText : '';
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = 'OK ✓';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 2000);
+    }).catch(() => showToast('Copia non riuscita', 'error'));
   }
 
   function setNeuralState(state) {
@@ -1339,13 +1439,87 @@ requestAnimationFrame(draw);
     if (el) el.remove();
   }
 
+  // ── Toast notifications ─────────────────────────────────────────────────
+  function showToast(message, type = 'info', durationMs = 4000) {
+    const container = document.getElementById('toast-container');
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.textContent = message;
+    container.appendChild(toast);
+    setTimeout(() => {
+      toast.classList.add('out');
+      toast.addEventListener('animationend', () => toast.remove(), { once: true });
+    }, durationMs);
+  }
+
+  // ── Markdown rendering sicuro (XSS-safe) ────────────────────────────────
+  // Strategia: escape HTML prima, poi applica solo tag sicuri e controllati.
+  function escapeHtml(str) {
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
   function formatMessage(text) {
-    return text
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.*?)\*/g, '<em>$1</em>')
-      .replace(/`([^`]+)`/g, '<code style="font-family:var(--mono);color:var(--accent3);background:var(--bg);padding:2px 6px;">$1</code>')
-      .replace(/```([\s\S]*?)```/g, '<pre>$1</pre>')
-      .replace(/\n/g, '<br>');
+    // 1. Estrae blocchi ```code``` prima dell'escape per preservarli
+    const codeBlocks = [];
+    let s = text.replace(/```([\s\S]*?)```/g, (_, code) => {
+      codeBlocks.push(escapeHtml(code));
+      return `\x00CODE${codeBlocks.length - 1}\x00`;
+    });
+
+    // 2. Estrae inline `code`
+    const inlineCodes = [];
+    s = s.replace(/`([^`\n]+)`/g, (_, code) => {
+      inlineCodes.push(escapeHtml(code));
+      return `\x00INLINE${inlineCodes.length - 1}\x00`;
+    });
+
+    // 3. Escape tutto il testo rimanente
+    s = escapeHtml(s);
+
+    // 4. Tabelle markdown (| col | col |)
+    s = s.replace(/((?:\|.+\|\n?)+)/g, (tableBlock) => {
+      const rows = tableBlock.trim().split('\n').filter(r => r.trim());
+      if (rows.length < 2) return tableBlock;
+      let html = '<table>';
+      rows.forEach((row, i) => {
+        if (/^\|[-|\s:]+\|$/.test(row.replace(/\s/g, ''))) return; // riga separatore
+        const cells = row.split('|').filter((_, ci) => ci > 0 && ci < row.split('|').length - 1);
+        html += i === 0 ? '<tr>' + cells.map(c => `<th>${c.trim()}</th>`).join('') + '</tr>'
+                        : '<tr>' + cells.map(c => `<td>${c.trim()}</td>`).join('') + '</tr>';
+      });
+      html += '</table>';
+      return html;
+    });
+
+    // 5. Headers
+    s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+    s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+    s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+
+    // 6. Grassetto e corsivo
+    s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+    // 7. Link [testo](url) — solo http/https per sicurezza
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+    // 8. Separatore orizzontale
+    s = s.replace(/^---$/gm, '<hr>');
+
+    // 9. Newline → <br>
+    s = s.replace(/\n/g, '<br>');
+
+    // 10. Reinserisce blocchi code
+    s = s.replace(/\x00CODE(\d+)\x00/g, (_, i) => `<pre>${codeBlocks[+i]}</pre>`);
+    s = s.replace(/\x00INLINE(\d+)\x00/g,
+      (_, i) => `<code style="font-family:var(--mono);color:var(--accent3);background:rgba(0,0,0,0.28);padding:2px 6px;border-radius:4px;">${inlineCodes[+i]}</code>`);
+
+    return s;
   }
 
   let pendingFile = null;
@@ -1354,7 +1528,7 @@ requestAnimationFrame(draw);
   function onFileSelected(event) {
     const file = event.target.files[0];
     if (!file) return;
-    if (file.size > 10 * 1024 * 1024) { alert('File troppo grande. Limite: 10MB'); event.target.value=''; return; }
+    if (file.size > 10 * 1024 * 1024) { showToast('File troppo grande. Limite: 10 MB', 'error'); event.target.value=''; return; }
     pendingFile = file;
     const preview = document.getElementById('attachment-preview');
     preview.innerHTML = ''; preview.style.display = 'flex';
@@ -1406,7 +1580,12 @@ requestAnimationFrame(draw);
 
     try {
       const res = await fetch('/chat', { method: 'POST', body: fd });
-      if (!res.ok) throw new Error('Server error ' + res.status);
+      if (!res.ok) {
+        const detail = await res.json().then(d => d.detail).catch(() => null);
+        if (res.status === 429) showToast(detail || 'Troppe richieste. Attendi un momento.', 'warning');
+        else showToast(detail || `Errore server (${res.status})`, 'error');
+        throw new Error('Server error ' + res.status);
+      }
 
       removeThinking();
       // Create bot bubble before stream starts
@@ -1443,8 +1622,11 @@ requestAnimationFrame(draw);
             updateNeuralStatsReal(evt);
           } else if (evt.type === 'done') {
             // streaming complete
+          } else if (evt.type === 'search_skipped') {
+            // Web search non disponibile — mostra piccolo banner sotto il thinking
+            showToast(evt.reason || 'Web search non disponibile', 'warning', 5000);
           } else if (evt.type === 'error') {
-            if (botContent) botContent.innerHTML = '⚠ ' + (evt.message || 'Errore.');
+            if (botContent) botContent.innerHTML = '⚠ ' + escapeHtml(evt.message || 'Errore.');
           }
         }
       }

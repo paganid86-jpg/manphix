@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException, Form, UploadFile, File, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import anthropic
 import groq as groq_sdk
 from tavily import TavilyClient
 import os
+import secrets
 import httpx
 import asyncpg
 import uuid
@@ -74,12 +75,48 @@ async def init_db():
         """)
         logger.info("Database inizializzato con indici")
 
+SESSION_EXPIRY_HOURS = 24  # sessioni inattive da più di 24h vengono eliminate
+
+async def _session_cleanup_loop():
+    """
+    Job async che gira ogni ora ed elimina sessioni scadute (>24h senza messaggi).
+    Prevenzione accumulo dati, tutela privacy.
+    """
+    while True:
+        try:
+            await asyncio.sleep(3600)  # ogni ora
+            async with db_pool.acquire() as conn:
+                # Elimina messaggi di sessioni scadute
+                deleted = await conn.fetchval("""
+                    WITH expired AS (
+                        SELECT s.session_id
+                        FROM sessions s
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM messages m
+                            WHERE m.session_id = s.session_id
+                              AND m.created_at > NOW() - INTERVAL '24 hours'
+                        )
+                        AND s.created_at < NOW() - INTERVAL '24 hours'
+                    )
+                    DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM expired)
+                    RETURNING session_id
+                """)
+                if deleted:
+                    logger.info(f"Cleanup: rimossa sessione scaduta {deleted}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Session cleanup errore: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     await init_db()
+    # Avvia cleanup job in background (non bloccante)
+    cleanup_task = asyncio.create_task(_session_cleanup_loop())
     yield
+    cleanup_task.cancel()
     await db_pool.close()
 
 app = FastAPI(lifespan=lifespan)
@@ -99,7 +136,14 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# --- MIGLIORIA: confronto password sicuro (no timing attack) ---
 ACCESS_PASSWORD = os.environ.get("MANPHIX_PASSWORD", "manphix2024")
+
+# --- MIGLIORIA: KNOWLEDGE BASE CACHE con TTL 5 minuti ---
+# Evita di fare fetch GitHub ad ogni singola richiesta chat
+KB_CACHE_TTL = 300  # secondi
+_kb_cache: Dict[str, Any] = {"main": None, "learnings": None}
+_kb_cache_ts: Dict[str, float] = {"main": 0.0, "learnings": 0.0}
 anthropic_client = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 groq_client = groq_sdk.Groq(api_key=os.environ.get("GROQ_API_KEY")) if os.environ.get("GROQ_API_KEY") else None
 tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
@@ -447,9 +491,9 @@ async def clear_session_messages(session_id: str):
 
 # --- FUNZIONI DI RECUPERO CONOSCENZA ---
 
-async def get_github_file_content(file_path: str) -> str:
+async def _fetch_github_file_content(file_path: str) -> str:
+    """Fetch raw da GitHub, senza cache."""
     url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{file_path}"
-    # --- MIGLIORIA 4: timeout esplicito + logging ---
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers=HEADERS)
@@ -464,10 +508,29 @@ async def get_github_file_content(file_path: str) -> str:
         logger.error(f"GitHub file {file_path}: {e}")
         return ""
 
-async def get_all_learnings() -> str:
+async def get_github_file_content(file_path: str) -> str:
+    """
+    Wrapper con cache TTL 5 min.
+    Usa il valore in cache se fresco, altrimenti ri-fetcha e aggiorna.
+    In caso di errore fetch, restituisce il valore cache precedente (stale) se disponibile.
+    """
+    now = time.time()
+    if now - _kb_cache_ts["main"] < KB_CACHE_TTL and _kb_cache["main"] is not None:
+        return _kb_cache["main"]
+    fresh = await _fetch_github_file_content(file_path)
+    if fresh:
+        _kb_cache["main"] = fresh
+        _kb_cache_ts["main"] = now
+        logger.info("Knowledge Base (main) aggiornata dalla cache")
+    elif _kb_cache["main"] is not None:
+        logger.warning("GitHub main KB non raggiungibile — uso cache stale")
+        return _kb_cache["main"]
+    return fresh
+
+async def _fetch_all_learnings() -> str:
+    """Fetch raw learnings da GitHub, senza cache."""
     api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/.learnings"
     all_lessons = ""
-    # --- MIGLIORIA 4: timeout esplicito + logging ---
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(api_url, headers=HEADERS)
@@ -491,12 +554,48 @@ async def get_all_learnings() -> str:
         logger.error(f"GitHub learnings: {e}")
         return ""
 
+async def get_all_learnings() -> str:
+    """
+    Wrapper con cache TTL 5 min per i learnings.
+    Stessa logica stale-fallback di get_github_file_content.
+    """
+    now = time.time()
+    if now - _kb_cache_ts["learnings"] < KB_CACHE_TTL and _kb_cache["learnings"] is not None:
+        return _kb_cache["learnings"]
+    fresh = await _fetch_all_learnings()
+    if fresh:
+        _kb_cache["learnings"] = fresh
+        _kb_cache_ts["learnings"] = now
+        logger.info("Knowledge Base (learnings) aggiornata dalla cache")
+    elif _kb_cache["learnings"] is not None:
+        logger.warning("GitHub learnings non raggiungibili — uso cache stale")
+        return _kb_cache["learnings"]
+    return fresh
+
 
 # --- ENDPOINTS ---
 
 @app.get("/")
 async def root():
     return FileResponse("static/index.html")
+
+# --- MIGLIORIA: Health check per Render monitoring ---
+@app.get("/health")
+async def health():
+    """Endpoint leggero per uptime monitoring.
+    Verifica anche connettività DB (ping semplice)."""
+    db_ok = False
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        db_ok = True
+    except Exception as e:
+        logger.error(f"Health check DB fallito: {e}")
+    status = "ok" if db_ok else "degraded"
+    return JSONResponse(
+        content={"status": status, "db": db_ok},
+        status_code=200 if db_ok else 503,
+    )
 
 @app.get("/api/models")
 async def get_models():
@@ -520,7 +619,8 @@ async def get_models():
 
 @app.post("/login")
 async def login(req: LoginRequest):
-    if req.password != ACCESS_PASSWORD:
+    # compare_digest previene timing attacks (confronto a tempo costante)
+    if not secrets.compare_digest(req.password, ACCESS_PASSWORD):
         raise HTTPException(status_code=401, detail="Password errata")
     session_id = str(uuid.uuid4())
     await create_session(session_id)
@@ -597,7 +697,6 @@ Domanda: {message}"""
                 logger.warning(f"Anthropic query preprocessing: {e}, uso messaggio originale")
                 search_query = message
 
-            # --- MIGLIORIA 4: logging errori Tavily ---
             try:
                 risultati = tavily_client.search(
                     search_query,
@@ -612,6 +711,8 @@ Domanda: {message}"""
                     text_message = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {message}"
             except Exception as e:
                 logger.warning(f"Tavily search fallita ('{search_query}'): {e}")
+                # Notifica il frontend che la ricerca web non era disponibile
+                yield f'data: {json.dumps({"type": "search_skipped", "reason": "Web search non disponibile — rispondo con conoscenza locale."})}\n\n'
 
         # 5. Gestione file allegato
         db_message      = text_message
