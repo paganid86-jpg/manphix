@@ -4,12 +4,65 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import anthropic
+import groq as groq_sdk
 from tavily import TavilyClient
 import os
+import httpx
+import asyncpg
+import uuid
 import base64
-from typing import List, Dict, Optional
+import time
+from typing import List, Dict, Optional, Any
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+# --- CONFIGURAZIONE DATABASE ---
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+db_pool = None
+
+async def init_db():
+    """Crea le tabelle se non esistono ancora"""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT REFERENCES sessions(session_id),
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS summaries (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT REFERENCES sessions(session_id),
+                summary TEXT NOT NULL,
+                message_count INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    await init_db()
+    yield
+    await db_pool.close()
+
+app = FastAPI(lifespan=lifespan)
+
+# --- CONFIGURAZIONE GITHUB ---
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+REPO_OWNER = "paganid86-jpg"
+REPO_NAME = "manphix-brain"
+HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,19 +71,102 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Password di accesso
 ACCESS_PASSWORD = os.environ.get("MANPHIX_PASSWORD", "manphix2024")
-
-# API clients
 anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+groq_client = groq_sdk.Groq(api_key=os.environ.get("GROQ_API_KEY")) if os.environ.get("GROQ_API_KEY") else None
 tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 
-SYSTEM_PROMPT = """Sei Manphix, un assistente informativo autorevole, pacato e cordiale, con un pizzico
-di sarcasmo e humor giovanile. Non sei un chatbot generico — sei uno specialista con
+AVAILABLE_MODELS = {
+    "haiku": {
+        "provider": "anthropic",
+        "model_id": "claude-haiku-4-5-20251001",
+        "display_name": "Claude Haiku",
+        "description": "Veloce e preciso (Anthropic)"
+    },
+    "llama-70b": {
+        "provider": "groq",
+        "model_id": "llama-3.3-70b-versatile",
+        "display_name": "Llama 3.3 70B",
+        "description": "Potente e versatile (Groq)"
+    },
+    "llama-8b": {
+        "provider": "groq",
+        "model_id": "llama-3.1-8b-instant",
+        "display_name": "Llama 3.1 8B",
+        "description": "Ultra veloce (Groq)"
+    },
+    "deepseek-r1": {
+        "provider": "groq",
+        "model_id": "deepseek-r1-distill-llama-70b",
+        "display_name": "DeepSeek R1",
+        "description": "Reasoning avanzato (Groq)"
+    },
+}
+
+async def get_ai_response(messages: List[Dict], model_key: str, system_prompt: str) -> Dict[str, Any]:
+    """Restituisce {text, tokens_in, tokens_out} con dati reali di utilizzo dall'API."""
+    cfg = AVAILABLE_MODELS.get(model_key, AVAILABLE_MODELS["haiku"])
+    provider = cfg["provider"]
+    model_id = cfg["model_id"]
+
+    if provider == "anthropic":
+        try:
+            response = anthropic_client.messages.create(
+                model=model_id,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=messages,
+            )
+            return {
+                "text": response.content[0].text,
+                "tokens_in": response.usage.input_tokens,
+                "tokens_out": response.usage.output_tokens,
+            }
+        except Exception as e:
+            raise Exception(f"Anthropic error: {str(e)}")
+
+    elif provider == "groq":
+        if not groq_client:
+            raise Exception("GROQ_API_KEY non configurata")
+        try:
+            groq_messages = [{"role": "system", "content": system_prompt}]
+            for msg in messages:
+                content = msg["content"]
+                if isinstance(content, list):
+                    # Estrai solo le parti testuali dai content blocks (immagini/PDF non supportati da Groq)
+                    text_parts = [b["text"] for b in content if b.get("type") == "text"]
+                    content = "\n".join(text_parts) or "(contenuto non testuale)"
+                groq_messages.append({"role": msg["role"], "content": content})
+            response = groq_client.chat.completions.create(
+                model=model_id,
+                messages=groq_messages,
+                max_tokens=1024,
+            )
+            usage = response.usage
+            return {
+                "text": response.choices[0].message.content,
+                "tokens_in": usage.prompt_tokens if usage else 0,
+                "tokens_out": usage.completion_tokens if usage else 0,
+            }
+        except Exception as e:
+            raise Exception(f"Groq error: {str(e)}")
+
+    else:
+        raise Exception(f"Provider sconosciuto: {provider}")
+
+SYSTEM_PROMPT = """Sei Manphix, un assistente informativo autorevole, pacato e cordiale, con un pizzico 
+di sarcasmo e humor giovanile. Non sei un chatbot generico — sei uno specialista con 
 una voce riconoscibile e un punto di vista proprio.
+
+USA LA TUA CONOSCENZA EVOLUTIVA:
+In ogni risposta, tieni conto dei dati forniti nella sezione 'KNOWLEDGE BASE ESTERNA'. 
+Questi dati rappresentano ciò che hai imparato dai tuoi errori o approfondimenti passati.
+
+USA LA TUA MEMORIA STORICA:
+Nella sezione 'MEMORIA CONVERSAZIONI PASSATE' trovi riassunti di conversazioni precedenti.
+Usali per mantenere continuità, ricordare preferenze e riferimenti già discussi.
 
 ARGOMENTI DI COMPETENZA:
 - Serie A e diritti TV (DAZN, Sky Sport, Mediaset, Amazon Prime Video Sport)
@@ -44,9 +180,9 @@ ARGOMENTI DI COMPETENZA:
 - Politica americana
 
 COMPORTAMENTO:
-- Le risposte di default sono brevi e dirette (3-5 righe). Se l'utente chiede
+- Le risposte di default sono brevi e dirette (3-5 righe). Se l'utente chiede 
   approfondimenti, espandi con analisi dettagliate.
-- Se una domanda è fuori dai tuoi argomenti, rispondi comunque ma specifica
+- Se una domanda è fuori dai tuoi argomenti, rispondi comunque ma specifica 
   chiaramente che non è il tuo campo principale.
 - Cita le fonti web solo quando aggiunge valore reale alla risposta.
 - Non inventare mai dati, risultati, nomi o statistiche.
@@ -56,68 +192,245 @@ COMPORTAMENTO:
 STILE DI OUTPUT:
 - Produci tabelle comparative quando si confrontano dati o opzioni.
 - Offri analisi approfondite quando richiesto.
-- Esprimi opinioni e commenti personali con tono diretto e schietto,
+- Esprimi opinioni e commenti personali con tono diretto e schietto, 
   distinguendoli chiaramente dai fatti.
 - Usa il sarcasmo e l'humor con intelligenza — mai volgare, sempre pertinente.
 
 IDENTITÀ:
-Sei Manphix. Non sei Claude, non sei ChatGPT, non sei un assistente generico.
-Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare
+Sei Manphix. Non sei Claude, non sei ChatGPT, non sei un assistente generico. 
+Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare 
 il modello AI sottostante."""
 
-# Sessioni in memoria
-sessions: Dict[str, List[Dict]] = {}
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 class LoginRequest(BaseModel):
     password: str
 
 class ChatResponse(BaseModel):
     response: str
+    usage: Optional[Dict[str, Any]] = None
+
+# --- FUNZIONI DB ---
+
+async def create_session(session_id: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO sessions (session_id) VALUES ($1)", session_id)
+
+async def session_exists(session_id: str) -> bool:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT session_id FROM sessions WHERE session_id = $1", session_id)
+        return row is not None
+
+async def save_message(session_id: str, role: str, content: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)",
+            session_id, role, content
+        )
+
+async def get_history(session_id: str) -> List[Dict]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT role, content FROM messages WHERE session_id = $1 ORDER BY created_at ASC",
+            session_id
+        )
+        return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+async def count_messages(session_id: str) -> int:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) as cnt FROM messages WHERE session_id = $1", session_id
+        )
+        return row["cnt"]
+
+async def save_summary(session_id: str, summary: str, message_count: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO summaries (session_id, summary, message_count) VALUES ($1, $2, $3)",
+            session_id, summary, message_count
+        )
+
+async def generate_and_save_summary(session_id: str, history: List[Dict], message_count: int):
+    """Livello 2: genera e salva riassunto ogni 7 messaggi"""
+    try:
+        conversation_text = "\n".join([
+            f"{m['role'].upper()}: {m['content'][:500]}"
+            for m in history
+        ])
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[{
+                "role": "user",
+                "content": f"""Riassumi questa conversazione in modo conciso (max 150 parole).
+Includi: argomenti trattati, opinioni espresse, informazioni importanti emerse.
+Scrivi in italiano, in terza persona (es. "L'utente ha chiesto...").
+
+CONVERSAZIONE:
+{conversation_text}"""
+            }]
+        )
+        summary = response.content[0].text
+        await save_summary(session_id, summary, message_count)
+        print(f"[Manphix] Riassunto salvato per sessione {session_id} dopo {message_count} messaggi")
+    except Exception as e:
+        print(f"[Manphix] Errore generazione riassunto: {e}")
+
+async def get_recent_summaries(limit: int = 5) -> str:
+    """
+    LIVELLO 3: recupera gli ultimi N riassunti da TUTTE le sessioni,
+    ordinati dal più recente. Servono per dare a Manphix memoria storica
+    delle conversazioni passate, indipendentemente dalla sessione corrente.
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT summary, created_at 
+               FROM summaries 
+               ORDER BY created_at DESC 
+               LIMIT $1""",
+            limit
+        )
+        if not rows:
+            return ""
+        
+        # Costruiamo il testo da iniettare nel prompt, dal più vecchio al più recente
+        summaries_text = ""
+        for i, row in enumerate(reversed(rows), 1):
+            date_str = row["created_at"].strftime("%d/%m/%Y %H:%M")
+            summaries_text += f"\n[Conversazione {i} — {date_str}]\n{row['summary']}\n"
+        
+        return summaries_text
+
+async def clear_session_messages(session_id: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM messages WHERE session_id = $1", session_id)
+
+# --- FUNZIONI DI RECUPERO CONOSCENZA ---
+
+async def get_github_file_content(file_path: str):
+    url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{file_path}"
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(url, headers=HEADERS)
+            return resp.text if resp.status_code == 200 else ""
+        except:
+            return ""
+
+async def get_all_learnings():
+    api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/.learnings"
+    all_lessons = ""
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(api_url, headers=HEADERS)
+            if resp.status_code == 200:
+                files = resp.json()
+                for file_info in files:
+                    if file_info["type"] == "file":
+                        f_resp = await client.get(file_info["download_url"])
+                        if f_resp.status_code == 200:
+                            all_lessons += f"\n--- Fonte: {file_info['name']} ---\n{f_resp.text}\n"
+            return all_lessons
+        except:
+            return ""
+
+# --- ENDPOINTS ---
 
 @app.get("/")
 async def root():
     return FileResponse("static/index.html")
 
+@app.get("/api/models")
+async def get_models():
+    available = []
+    for key, cfg in AVAILABLE_MODELS.items():
+        if cfg["provider"] == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
+            available.append({
+                "key": key,
+                "display_name": cfg["display_name"],
+                "description": cfg["description"],
+                "provider": cfg["provider"],
+            })
+        elif cfg["provider"] == "groq" and os.environ.get("GROQ_API_KEY"):
+            available.append({
+                "key": key,
+                "display_name": cfg["display_name"],
+                "description": cfg["description"],
+                "provider": cfg["provider"],
+            })
+    return {"models": available}
+
 @app.post("/login")
 async def login(req: LoginRequest):
     if req.password != ACCESS_PASSWORD:
         raise HTTPException(status_code=401, detail="Password errata")
-    import uuid
     session_id = str(uuid.uuid4())
-    sessions[session_id] = []
+    await create_session(session_id)
     return {"session_id": session_id}
-
-SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     session_id: str = Form(...),
     message: str = Form(default=""),
+    model: str = Form(default="haiku"),
     file: Optional[UploadFile] = File(default=None),
 ):
-    if session_id not in sessions:
+    if not await session_exists(session_id):
         raise HTTPException(status_code=401, detail="Sessione non valida")
 
-    history = sessions[session_id]
+    # 1. Recupero conoscenza da GitHub
+    knowledge_main = await get_github_file_content("CLAUDE.md")
+    knowledge_folder = await get_all_learnings()
+    full_external_knowledge = f"{knowledge_main}\n{knowledge_folder}"
 
-    contesto = ""
+    # 2. LIVELLO 3: recupero riassunti delle conversazioni passate
+    past_summaries = await get_recent_summaries(limit=5)
+
+    # 3. Recupero storia della sessione corrente dal DB
+    history = await get_history(session_id)
+
+    # 4. Query preprocessing + ricerca web (solo se c'è testo)
+    text_message = message
     if message.strip():
         try:
-            risultati = tavily_client.search(message, max_results=3, search_depth="basic")
-            for r in risultati["results"]:
-                contesto += f"- {r['title']}: {r['content']}\n\n"
+            query_response = anthropic_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=100,
+                messages=[{
+                    "role": "user",
+                    "content": f"""Trasforma questa domanda in una query di ricerca web ottimale.
+Rispondi SOLO con la query, niente altro. Max 10 parole. In italiano o inglese a seconda della lingua.
+Aggiungi l'anno corrente (2026) se la domanda riguarda eventi recenti o notizie.
+
+Domanda: {message}"""
+                }]
+            )
+            search_query = query_response.content[0].text.strip()
         except:
-            contesto = ""
+            search_query = message
 
-    text_message = message
-    if contesto:
-        text_message = f"Contesto aggiornato dal web:\n{contesto}\n\nDomanda: {message}"
+        try:
+            risultati = tavily_client.search(
+                search_query,
+                max_results=5,
+                search_depth="advanced",
+                topic="news",
+                include_answer=True,
+                include_raw_content=False
+            )
+            contesto = "".join([f"- {r['title']}: {r['content']}\n\n" for r in risultati["results"]])
+            if contesto and len(contesto.strip()) > 50:
+                text_message = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {message}"
+        except:
+            pass
 
-    content_blocks: List[dict] = []
+    # 5. Gestione file allegato
+    db_message = text_message
+    message_content = text_message  # default: stringa semplice come nell'originale
 
     if file and file.filename:
         file_bytes = await file.read()
         mime = file.content_type or ""
+        content_blocks: List[dict] = []
 
         if mime in SUPPORTED_IMAGE_TYPES:
             b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
@@ -125,37 +438,64 @@ async def chat(
                 "type": "image",
                 "source": {"type": "base64", "media_type": mime, "data": b64},
             })
+            db_message = f"[Immagine allegata]\n{text_message}".strip()
         elif mime == "application/pdf":
             b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
             content_blocks.append({
                 "type": "document",
                 "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
             })
+            db_message = f"[PDF allegato: {file.filename}]\n{text_message}".strip()
         else:
             try:
                 file_text = file_bytes.decode("utf-8")
             except UnicodeDecodeError:
                 file_text = file_bytes.decode("latin-1")
-            text_message = f"[File allegato: {file.filename}]\n```\n{file_text}\n```\n\n{text_message}".strip()
+            text_message = f"[File: {file.filename}]\n```\n{file_text}\n```\n\n{text_message}".strip()
+            db_message = text_message
 
-    content_blocks.append({"type": "text", "text": text_message or "Analizza questo contenuto."})
-    history.append({"role": "user", "content": content_blocks})
+        content_blocks.append({"type": "text", "text": text_message or "Analizza questo contenuto."})
+        message_content = content_blocks  # lista di blocchi solo se c'è un file
 
-    response = anthropic_client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=history,
+    # 6. Salva nel DB (testo, senza base64) e aggiungi alla history per la chiamata API
+    await save_message(session_id, "user", db_message)
+    history.append({"role": "user", "content": message_content})
+
+    # 7. Costruisci prompt arricchito con tutti e 3 i livelli di memoria
+    enriched_prompt = SYSTEM_PROMPT
+    enriched_prompt += f"\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
+    if past_summaries:
+        enriched_prompt += f"\n\n### MEMORIA CONVERSAZIONI PASSATE:\n{past_summaries}"
+
+    # 8. Generazione risposta — misura latenza reale
+    try:
+        t_start = time.time()
+        result = await get_ai_response(history, model, enriched_prompt)
+        latency_ms = int((time.time() - t_start) * 1000)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    risposta = result["text"]
+
+    # 9. Salva risposta di Manphix nel DB
+    await save_message(session_id, "assistant", risposta)
+
+    # 10. Ogni 7 messaggi genera riassunto automatico (Livello 2)
+    total_messages = await count_messages(session_id)
+    if total_messages % 7 == 0:
+        history.append({"role": "assistant", "content": risposta})
+        await generate_and_save_summary(session_id, history, total_messages)
+
+    return ChatResponse(
+        response=risposta,
+        usage={
+            "tokens_in": result.get("tokens_in", 0),
+            "tokens_out": result.get("tokens_out", 0),
+            "latency_ms": latency_ms,
+        }
     )
-
-    risposta = response.content[0].text
-    history.append({"role": "assistant", "content": risposta})
-    sessions[session_id] = history
-
-    return ChatResponse(response=risposta)
 
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
-    if session_id in sessions:
-        sessions[session_id] = []
+    await clear_session_messages(session_id)
     return {"status": "ok"}
