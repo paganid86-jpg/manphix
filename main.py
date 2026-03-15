@@ -101,7 +101,7 @@ AVAILABLE_MODELS = {
     },
     "deepseek-r1": {
         "provider": "groq",
-        "model_id": "deepseek-r1-distill-llama-70b",
+        "model_id": "deepseek-r1-distill-qwen-32b",
         "display_name": "DeepSeek R1",
         "description": "Reasoning avanzato (Groq)"
     },
