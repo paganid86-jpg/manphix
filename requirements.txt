@@ -1,6 +1,8 @@
 fastapi==0.111.0
 uvicorn==0.30.1
-anthropic>=0.40.0
+anthropic>=0.49.0
 tavily-python==0.3.3
 python-multipart==0.0.9
-asyncpg==0.30.0
+httpx
+asyncpg
+groq>=0.9.0
