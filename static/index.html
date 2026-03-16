@@ -322,7 +322,7 @@
   #neural-panel {
     grid-column: 1;
     grid-row: 2;
-    background: rgba(10, 5, 22, 0.22);
+    background: rgba(10, 5, 22, 0.08);
     border-right: 1px solid rgba(255, 255, 255, 0.07);
     display: flex;
     flex-direction: column;
@@ -969,7 +969,7 @@
 
   /* .glass-premium: pannello chat principale — vetro più profondo + alone viola */
   .glass-premium {
-    background: rgba(10, 5, 22, 0.22);
+    background: rgba(10, 5, 22, 0.08);
     -webkit-backdrop-filter: url(#glass-filter) blur(36px) saturate(1.8);
     backdrop-filter: url(#glass-filter) blur(36px) saturate(1.8);
     box-shadow:
@@ -1783,11 +1783,11 @@ requestAnimationFrame(draw);
 
   let W, H, nodes, edges, pulses;
   let lastPulseT = 0;
-  let nextPulseDelay = 3200;
+  let nextPulseDelay = 1800;
 
   /* ── Palette impulsi ──────────────────────────────────────────────────── */
   const PULSE_COLORS = ['#8B5CF6', '#06B6D4', '#A5F3FC', '#7C3AED'];
-  const BASE_OP = 0.035; // opacità base della rete (quasi invisibile)
+  const BASE_OP = 0.10; // opacità base della rete
 
   /* ── Costruzione rete ─────────────────────────────────────────────────── */
   function buildNetwork() {
@@ -1905,7 +1905,7 @@ requestAnimationFrame(draw);
   /* ── Spawn impulso ────────────────────────────────────────────────────── */
   function spawnPulse(t) {
     lastPulseT = t;
-    nextPulseDelay = 3000 + Math.random() * 2200;
+    nextPulseDelay = 1500 + Math.random() * 1500;
     pulses.push(new Pulse(Math.floor(Math.random() * nodes.length), t));
   }
 
@@ -1934,9 +1934,9 @@ requestAnimationFrame(draw);
       ctx.save();
       if (maxG > 0.01) {
         const [r, g, b] = hexRgb(glowColor);
-        ctx.strokeStyle = `rgba(${r},${g},${b},${BASE_OP + maxG * 0.72})`;
-        ctx.lineWidth = 0.6 + maxG * 2.4;
-        ctx.shadowBlur = 8 + maxG * 16;
+        ctx.strokeStyle = `rgba(${r},${g},${b},${BASE_OP + maxG * 0.85})`;
+        ctx.lineWidth = 0.8 + maxG * 3.0;
+        ctx.shadowBlur = 12 + maxG * 24;
         ctx.shadowColor = glowColor;
       } else {
         ctx.strokeStyle = `rgba(148,110,255,${BASE_OP})`;
@@ -1963,8 +1963,8 @@ requestAnimationFrame(draw);
       ctx.save();
       if (maxG > 0.01) {
         const [r, g, b] = hexRgb(glowColor);
-        ctx.fillStyle = `rgba(${r},${g},${b},${BASE_OP * 1.8 + maxG * 0.88})`;
-        ctx.shadowBlur = 8 + maxG * 20;
+        ctx.fillStyle = `rgba(${r},${g},${b},${BASE_OP * 1.8 + maxG * 0.95})`;
+        ctx.shadowBlur = 12 + maxG * 28;
         ctx.shadowColor = glowColor;
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r + maxG * 4.5, 0, Math.PI * 2);
