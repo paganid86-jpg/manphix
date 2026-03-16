@@ -949,6 +949,104 @@
   }
 
   /* ══════════════════════════════════════════════════════
+     VOICE MODE
+  ══════════════════════════════════════════════════════ */
+
+  /* Pulsante microfono nell'input */
+  #mic-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-size: 1.05rem;
+    width: 30px; height: 30px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    align-self: flex-end;
+    transition: color 0.22s var(--ease), opacity 0.22s var(--ease), transform 0.18s var(--ease);
+    opacity: 0.60;
+    position: relative;
+  }
+  #mic-btn:hover { color: var(--accent3); opacity: 1; }
+
+  /* Stato "in ascolto" — anello pulsante + colore ciano */
+  #mic-btn.listening {
+    color: var(--accent-cyan);
+    opacity: 1;
+    animation: micPulse 1.1s ease-in-out infinite;
+  }
+  #mic-btn.listening::after {
+    content: '';
+    position: absolute;
+    inset: -5px;
+    border-radius: 50%;
+    border: 2px solid var(--accent-cyan);
+    opacity: 0.5;
+    animation: micRing 1.1s ease-in-out infinite;
+  }
+  @keyframes micPulse {
+    0%, 100% { transform: scale(1); }
+    50%       { transform: scale(1.18); }
+  }
+  @keyframes micRing {
+    0%   { transform: scale(0.8); opacity: 0.6; }
+    100% { transform: scale(1.5); opacity: 0; }
+  }
+
+  /* Toggle voce nell'header */
+  #voice-toggle-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 0.58rem;
+    letter-spacing: 0.14em;
+    padding: 6px 14px;
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: all 0.28s var(--ease);
+    backdrop-filter: blur(8px);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+  }
+  #voice-toggle-btn:hover {
+    border-color: rgba(0, 229, 255, 0.35);
+    color: var(--accent-cyan);
+    background: rgba(0, 229, 255, 0.06);
+  }
+  #voice-toggle-btn.active {
+    border-color: rgba(0, 229, 255, 0.50);
+    color: var(--accent-cyan);
+    background: rgba(0, 229, 255, 0.10);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.10), 0 0 18px rgba(0,229,255,0.14);
+  }
+
+  /* Indicatore "Manphix sta parlando" nella status bar */
+  #speaking-indicator {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 0.60rem;
+    letter-spacing: 0.14em;
+    color: var(--accent-cyan);
+    opacity: 0.80;
+  }
+  #speaking-indicator.visible { display: flex; }
+  .speak-dot {
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--accent-cyan);
+    animation: speakBlink 0.7s ease-in-out infinite alternate;
+  }
+  .speak-dot:nth-child(2) { animation-delay: 0.15s; }
+  .speak-dot:nth-child(3) { animation-delay: 0.30s; }
+  @keyframes speakBlink {
+    from { opacity: 0.2; transform: scaleY(0.6); }
+    to   { opacity: 1;   transform: scaleY(1.4); }
+  }
+
+  /* ══════════════════════════════════════════════════════
      GLASSMORPHISM AVANZATO — classi applicabili
   ══════════════════════════════════════════════════════ */
 
@@ -1043,6 +1141,11 @@
         <span id="header-status-text">System Online</span>
       </div>
       <div class="header-actions">
+        <div id="speaking-indicator" title="Manphix sta parlando">
+          <div class="speak-dot"></div><div class="speak-dot"></div><div class="speak-dot"></div>
+          <span>Speaking</span>
+        </div>
+        <button id="voice-toggle-btn" onclick="toggleVoiceMode()" title="Attiva/disattiva lettura vocale risposte">🔈 Voice</button>
         <button class="btn-icon" onclick="clearChat()">Clear</button>
         <button class="btn-icon" onclick="logout()">Logout</button>
       </div>
@@ -1101,6 +1204,7 @@
                  accept="image/*,.pdf,.txt,.md,.csv,.log,.json,.py,.js"
                  onchange="onFileSelected(event)">
           <textarea id="user-input" rows="1" placeholder="Chiedi qualcosa a Manphix..." onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+          <button id="mic-btn" onclick="toggleListening()" title="Parla con Manphix">🎙</button>
           <button id="send-btn" onclick="sendMessage()">Send ›</button>
         </div>
         <div class="input-hint">Enter to send · Shift+Enter for new line · 📎 allega file</div>
@@ -1762,12 +1866,106 @@ requestAnimationFrame(draw);
     setNeuralState('idle');
     btn.disabled = false;
     input.focus();
+    speakText(accumulated);
   }
   async function clearChat() {
     if (!sessionId) return;
     await fetch(`/session/${sessionId}`, {method:'DELETE'});
     const msgs = document.getElementById('messages');
     msgs.innerHTML = `<div class="welcome"><div class="welcome-logo">MANPHIX</div><div class="welcome-sub">Real-time intelligence · Web-augmented · Always on</div><div class="welcome-topics"><span class="topic-tag" onclick="quickAsk('Ultime notizie Serie A')">Serie A</span><span class="topic-tag" onclick="quickAsk('Ultimi modelli AI usciti')">AI & LLM</span><span class="topic-tag" onclick="quickAsk('Situazione geopolitica attuale')">Geopolitica</span><span class="topic-tag" onclick="quickAsk('Nuova musica italiana 2025')">Musica IT</span><span class="topic-tag" onclick="quickAsk('Champions League aggiornamenti')">Champions</span><span class="topic-tag" onclick="quickAsk('Politica americana oggi')">Politica USA</span><span class="topic-tag" onclick="quickAsk('Cronaca nera USA recente')">Cronaca USA</span><span class="topic-tag" onclick="quickAsk('Trend podcast italiani')">Podcast</span></div></div>`;
+  }
+
+  // ── VOICE MODE ─────────────────────────────────────────────────────────────
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recognition  = null;
+  let isListening  = false;
+  let voiceMode    = false;
+
+  function initRecognition() {
+    const r = new SR();
+    r.lang            = 'it-IT';
+    r.continuous      = false;
+    r.interimResults  = true;
+
+    r.onstart = () => {
+      isListening = true;
+      document.getElementById('mic-btn').classList.add('listening');
+    };
+
+    r.onresult = (e) => {
+      const transcript = Array.from(e.results).map(r => r[0].transcript).join('');
+      const inp = document.getElementById('user-input');
+      inp.value = transcript;
+      autoResize(inp);
+      if (e.results[e.results.length - 1].isFinal) {
+        stopListening();
+        sendMessage();
+      }
+    };
+
+    r.onend = () => {
+      isListening = false;
+      document.getElementById('mic-btn').classList.remove('listening');
+    };
+
+    r.onerror = (e) => {
+      isListening = false;
+      document.getElementById('mic-btn').classList.remove('listening');
+      if (e.error !== 'no-speech') showToast('Microfono: ' + e.error, 'error');
+    };
+
+    return r;
+  }
+
+  function toggleListening() {
+    if (!SR) { showToast('Speech Recognition non supportato in questo browser', 'warning'); return; }
+    if (isListening) { stopListening(); return; }
+    window.speechSynthesis.cancel(); // interrompi eventuale lettura in corso
+    if (!recognition) recognition = initRecognition();
+    try { recognition.start(); } catch(e) { recognition = initRecognition(); recognition.start(); }
+  }
+
+  function stopListening() {
+    if (recognition && isListening) recognition.stop();
+  }
+
+  function toggleVoiceMode() {
+    voiceMode = !voiceMode;
+    document.getElementById('voice-toggle-btn').classList.toggle('active', voiceMode);
+    if (!voiceMode) {
+      window.speechSynthesis.cancel();
+      document.getElementById('speaking-indicator').classList.remove('visible');
+    }
+    showToast(voiceMode ? '🔈 Lettura vocale attiva' : '🔇 Lettura vocale disattivata', 'info', 2000);
+  }
+
+  function speakText(text) {
+    if (!voiceMode || !text || !window.speechSynthesis) return;
+    // Rimuovi markdown prima di leggere
+    const clean = text
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/`[^`]+`/g, '')
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/\*(.+?)\*/g, '$1')
+      .replace(/#{1,3} /g, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/---/g, '')
+      .replace(/\|[^\n]+/g, '')   // tabelle
+      .trim();
+    if (!clean) return;
+
+    window.speechSynthesis.cancel();
+    const utt = new SpeechSynthesisUtterance(clean);
+    utt.lang  = 'it-IT';
+    utt.rate  = 1.05;
+    utt.pitch = 1.0;
+
+    const indicator = document.getElementById('speaking-indicator');
+    utt.onstart = () => indicator.classList.add('visible');
+    utt.onend   = () => indicator.classList.remove('visible');
+    utt.onerror = () => indicator.classList.remove('visible');
+
+    window.speechSynthesis.speak(utt);
   }
 </script>
 
