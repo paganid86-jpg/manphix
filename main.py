@@ -14,6 +14,7 @@ import uuid
 import base64
 import time
 import json
+import re
 import asyncio
 import logging
 from collections import defaultdict
@@ -73,6 +74,31 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_summaries_created_at
             ON summaries(created_at DESC)
         """)
+
+        # --- FASE 2 RAG: pgvector + knowledge_chunks ---
+        # Prova ad abilitare pgvector (disponibile su Render PostgreSQL)
+        try:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            await conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS knowledge_chunks (
+                    id         SERIAL PRIMARY KEY,
+                    content    TEXT NOT NULL,
+                    embedding  VECTOR({VOYAGE_DIMS}),
+                    source     TEXT NOT NULL DEFAULT 'manual',
+                    topic      TEXT[],
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            # Indice GIN per full-text search in italiano
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_kc_fts
+                ON knowledge_chunks
+                USING GIN (to_tsvector('italian', content))
+            """)
+            logger.info("pgvector abilitato e tabella knowledge_chunks pronta")
+        except Exception as e:
+            logger.warning(f"pgvector non disponibile — vector store disabilitato: {e}")
+
         logger.info("Database inizializzato con indici")
 
 SESSION_EXPIRY_HOURS = 24  # sessioni inattive da più di 24h vengono eliminate
@@ -115,6 +141,8 @@ async def lifespan(app: FastAPI):
     await init_db()
     # Avvia cleanup job in background (non bloccante)
     cleanup_task = asyncio.create_task(_session_cleanup_loop())
+    # Indicizza KB nel vector store se non già fatto (fire-and-forget)
+    asyncio.create_task(index_kb_to_vector_store())
     yield
     cleanup_task.cancel()
     await db_pool.close()
@@ -147,6 +175,11 @@ _kb_cache_ts: Dict[str, float] = {"main": 0.0, "learnings": 0.0}
 anthropic_client = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 groq_client = groq_sdk.Groq(api_key=os.environ.get("GROQ_API_KEY")) if os.environ.get("GROQ_API_KEY") else None
 tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
+
+# --- VOYAGE AI (embeddings per vector store) ---
+VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY")
+VOYAGE_MODEL   = "voyage-3-lite"
+VOYAGE_DIMS    = 512        # dimensioni vettore voyage-3-lite
 
 AVAILABLE_MODELS = {
     "haiku": {
@@ -609,6 +642,276 @@ async def get_all_learnings() -> str:
     return fresh
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FASE 2 RAG — VECTOR STORE + HYBRID SEARCH
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def get_embedding(text: str) -> Optional[List[float]]:
+    """Chiama Voyage AI per ottenere il vettore di embedding. Ritorna None su errore."""
+    if not VOYAGE_API_KEY or not text.strip():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.voyageai.com/v1/embeddings",
+                headers={"Authorization": f"Bearer {VOYAGE_API_KEY}"},
+                json={"input": [text[:2000]], "model": VOYAGE_MODEL},
+            )
+            if resp.status_code == 200:
+                return resp.json()["data"][0]["embedding"]
+            logger.warning(f"Voyage AI: HTTP {resp.status_code} — {resp.text[:200]}")
+            return None
+    except Exception as e:
+        logger.error(f"Voyage AI embedding errore: {e}")
+        return None
+
+
+def chunk_text(text: str, source: str, max_chars: int = 500) -> List[Dict]:
+    """
+    Divide un testo markdown in chunk semantici rispettando le sezioni.
+    Ogni chunk mantiene il contesto dell'header di appartenenza.
+    """
+    chunks = []
+    sections = re.split(r'\n(?=#{1,3} )', text)
+    for section in sections:
+        section = section.strip()
+        if not section or len(section) < 30:
+            continue
+        if len(section) <= max_chars:
+            chunks.append({"content": section, "source": source})
+        else:
+            # Sezione lunga: split per paragrafi
+            paragraphs = section.split("\n\n")
+            current = ""
+            for p in paragraphs:
+                if len(current) + len(p) + 2 > max_chars and current:
+                    chunks.append({"content": current.strip(), "source": source})
+                    current = p
+                else:
+                    current = (current + "\n\n" + p).strip() if current else p
+            if current.strip() and len(current.strip()) >= 30:
+                chunks.append({"content": current.strip(), "source": source})
+    return chunks
+
+
+async def index_kb_to_vector_store(force: bool = False):
+    """
+    Fetch KB da GitHub, split in chunks, embed con Voyage AI, salva in pgvector.
+    force=True: cancella i chunk esistenti (esclusi 'conversation') e re-indicizza.
+    force=False: salta se già indicizzato.
+    """
+    if not VOYAGE_API_KEY:
+        logger.info("VOYAGE_API_KEY non impostata — KB indexing saltato")
+        return
+
+    try:
+        async with db_pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM knowledge_chunks WHERE source != 'conversation'"
+            )
+            if count > 0 and not force:
+                logger.info(f"Vector store già popolato ({count} chunks KB) — skip indicizzazione")
+                return
+            if force:
+                await conn.execute(
+                    "DELETE FROM knowledge_chunks WHERE source != 'conversation'"
+                )
+                logger.info("Vector store: chunk KB rimossi per re-indicizzazione")
+
+        # Fetch raw da GitHub (bypass cache per avere contenuto fresco)
+        kb_main      = await _fetch_github_file_content("CLAUDE.md")
+        kb_learnings = await _fetch_all_learnings()
+
+        all_chunks: List[Dict] = []
+        if kb_main:
+            all_chunks.extend(chunk_text(kb_main, "dante.md"))
+        if kb_learnings:
+            for section in kb_learnings.split("--- Fonte:"):
+                section = section.strip()
+                if not section:
+                    continue
+                sep = section.find(" ---\n")
+                if sep > 0:
+                    fname   = section[:sep].strip()
+                    content = section[sep + 4:].strip()
+                else:
+                    fname, content = "learnings", section
+                all_chunks.extend(chunk_text(content, f"learnings/{fname}"))
+
+        if not all_chunks:
+            logger.warning("Vector store: nessun chunk da indicizzare — KB vuota o non raggiungibile")
+            return
+
+        # Embed e salva in batch da 10 per rispettare i limiti Voyage
+        saved = 0
+        for i in range(0, len(all_chunks), 10):
+            batch = all_chunks[i:i + 10]
+            texts = [c["content"] for c in batch]
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        "https://api.voyageai.com/v1/embeddings",
+                        headers={"Authorization": f"Bearer {VOYAGE_API_KEY}"},
+                        json={"input": texts, "model": VOYAGE_MODEL},
+                    )
+                if resp.status_code != 200:
+                    logger.warning(f"Voyage batch {i}: HTTP {resp.status_code}")
+                    continue
+                embeddings = resp.json()["data"]
+            except Exception as e:
+                logger.error(f"Voyage batch {i} errore: {e}")
+                continue
+
+            async with db_pool.acquire() as conn:
+                for j, chunk in enumerate(batch):
+                    emb     = embeddings[j]["embedding"]
+                    emb_str = "[" + ",".join(str(x) for x in emb) + "]"
+                    await conn.execute(
+                        """INSERT INTO knowledge_chunks (content, embedding, source)
+                           VALUES ($1, $2::vector, $3)""",
+                        chunk["content"], emb_str, chunk["source"]
+                    )
+                    saved += 1
+
+        logger.info(f"Vector store: {saved}/{len(all_chunks)} chunks indicizzati")
+
+    except Exception as e:
+        logger.error(f"index_kb_to_vector_store errore: {e}")
+
+
+def rrf_merge(vec_results: list, kw_results: list, k: int = 60) -> list:
+    """Reciprocal Rank Fusion: fonde risultati vector search e keyword search."""
+    scores:   Dict[int, float] = {}
+    all_rows: Dict[int, dict]  = {}
+
+    for rank, row in enumerate(vec_results):
+        rid = row["id"]
+        scores[rid]   = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
+        all_rows[rid] = dict(row)
+
+    for rank, row in enumerate(kw_results):
+        rid = row["id"]
+        scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
+        if rid not in all_rows:
+            all_rows[rid] = dict(row)
+
+    sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    return [all_rows[rid] for rid in sorted_ids]
+
+
+async def hybrid_search(query: str, k: int = 6) -> List[Dict]:
+    """
+    Ricerca ibrida: vector similarity (Voyage AI) + full-text PostgreSQL, fusa con RRF.
+    Ritorna lista di dict {content, source}. Lista vuota se non disponibile.
+    """
+    if not VOYAGE_API_KEY:
+        return []
+    try:
+        q_emb = await get_embedding(query)
+        if not q_emb:
+            return []
+        q_emb_str = "[" + ",".join(str(x) for x in q_emb) + "]"
+
+        async with db_pool.acquire() as conn:
+            # 1. Vector search — top k per cosine similarity
+            vec_rows = await conn.fetch("""
+                SELECT id, content, source,
+                       1 - (embedding <=> $1::vector) AS score
+                FROM knowledge_chunks
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> $1::vector
+                LIMIT $2
+            """, q_emb_str, k)
+
+            # 2. Full-text search — dizionario italiano
+            kw_rows = await conn.fetch("""
+                SELECT id, content, source,
+                       ts_rank(
+                           to_tsvector('italian', content),
+                           plainto_tsquery('italian', $1)
+                       ) AS score
+                FROM knowledge_chunks
+                WHERE to_tsvector('italian', content)
+                      @@ plainto_tsquery('italian', $1)
+                ORDER BY score DESC
+                LIMIT $2
+            """, query, k)
+
+        merged = rrf_merge(list(vec_rows), list(kw_rows))
+        logger.info(
+            f"Hybrid search: {len(vec_rows)} vector + {len(kw_rows)} keyword → "
+            f"{len(merged)} merged per '{query[:60]}'"
+        )
+        return merged[:k]
+
+    except Exception as e:
+        logger.error(f"Hybrid search errore: {e}")
+        return []
+
+
+async def extract_and_store_learnings(conversation: List[Dict]):
+    """
+    Fire-and-forget: estrae fatti nuovi su Dante dalla conversazione appena conclusa
+    e li salva nel vector store come memoria permanente.
+    Richiede entrambe le API (Anthropic + Voyage). Si disattiva silenziosamente
+    se una delle due non è disponibile o la quota è esaurita.
+    """
+    if not VOYAGE_API_KEY:
+        return
+    try:
+        recent    = conversation[-8:]
+        conv_text = "\n".join([
+            f"{m['role'].upper()}: {str(m['content'])[:300]}"
+            for m in recent
+        ])
+        response = await anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{"role": "user", "content": f"""Analizza questa conversazione ed estrai SOLO fatti nuovi e verificabili
+su Dante (preferenze, abitudini, eventi della sua vita, opinioni esplicitamente dichiarate).
+Regole: solo affermazioni esplicite di Dante, no inferenze, no speculazioni.
+Se non ci sono fatti nuovi, rispondi esattamente con: []
+
+Output JSON (array, max 3 elementi):
+[{{"fatto": "...", "topic": ["tag"]}}]
+
+CONVERSAZIONE:
+{conv_text}"""}]
+        )
+        text  = response.content[0].text.strip()
+        match = re.search(r'\[.*?\]', text, re.DOTALL)
+        if not match:
+            return
+        facts = json.loads(match.group())
+        if not isinstance(facts, list) or not facts:
+            return
+
+        saved = 0
+        for fact in facts:
+            fatto = fact.get("fatto", "").strip()
+            if not fatto:
+                continue
+            emb = await get_embedding(fatto)
+            if not emb:
+                continue
+            emb_str = "[" + ",".join(str(x) for x in emb) + "]"
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO knowledge_chunks (content, embedding, source, topic)
+                       VALUES ($1, $2::vector, 'conversation', $3)""",
+                    fatto, emb_str, fact.get("topic", [])
+                )
+            saved += 1
+
+        if saved:
+            logger.info(f"Conversational learning: {saved} fatti nuovi salvati nel vector store")
+
+    except anthropic.RateLimitError:
+        logger.warning("Conversational learning: quota Anthropic esaurita — skip")
+    except Exception as e:
+        logger.error(f"Conversational learning errore: {e}")
+
+
 # --- ENDPOINTS ---
 
 @app.get("/")
@@ -697,10 +1000,18 @@ async def chat(
             raise HTTPException(status_code=400, detail=error_msg)
 
     async def _chat_generator() -> AsyncGenerator[str, None]:
-        # 1. Recupero conoscenza da GitHub
-        knowledge_main   = await get_github_file_content("CLAUDE.md")
-        knowledge_folder = await get_all_learnings()
-        full_external_knowledge = f"{knowledge_main}\n{knowledge_folder}"
+        # 1. Recupero conoscenza: hybrid search semantico se disponibile,
+        #    altrimenti fallback al caricamento completo da GitHub
+        relevant_chunks = await hybrid_search(message) if message.strip() else []
+        if relevant_chunks:
+            kb_context = "\n\n".join(
+                f"[{c['source']}] {c['content']}" for c in relevant_chunks
+            )
+        else:
+            # Fallback: KB completa da GitHub (comportamento pre-Fase2)
+            knowledge_main   = await get_github_file_content("CLAUDE.md")
+            knowledge_folder = await get_all_learnings()
+            kb_context       = f"{knowledge_main}\n{knowledge_folder}"
 
         # 2. LIVELLO 3: recupero riassunti delle conversazioni passate
         past_summaries = await get_recent_summaries(limit=5)
@@ -809,7 +1120,7 @@ Domanda: {message}"""
 
         # 7. Costruisci prompt arricchito con tutti e 3 i livelli di memoria
         enriched_prompt = SYSTEM_PROMPT
-        enriched_prompt += f"\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{full_external_knowledge}"
+        enriched_prompt += f"\n\n### KNOWLEDGE BASE ESTERNA (I tuoi apprendimenti):\n{kb_context}"
         if past_summaries:
             enriched_prompt += f"\n\n### MEMORIA CONVERSAZIONI PASSATE:\n{past_summaries}"
 
@@ -832,11 +1143,14 @@ Domanda: {message}"""
             # 10. Ogni 7 messaggi genera riassunto in background (non bloccante)
             # --- MIGLIORIA 5: asyncio.create_task() — fire-and-forget ---
             total_messages = await count_messages(session_id)
+            history.append({"role": "assistant", "content": full_response})
             if total_messages % 7 == 0:
-                history.append({"role": "assistant", "content": full_response})
                 asyncio.create_task(
                     generate_and_save_summary(session_id, history, total_messages)
                 )
+            # 11. Conversational learning: estrae fatti nuovi e aggiorna il vector store
+            #     Richiede Anthropic billing — si disattiva silenziosamente se esaurito
+            asyncio.create_task(extract_and_store_learnings(history))
 
     return StreamingResponse(
         _chat_generator(),
@@ -846,6 +1160,23 @@ Domanda: {message}"""
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/admin/reindex")
+async def reindex_kb(request: Request):
+    """
+    Forza re-indicizzazione completa della KB nel vector store.
+    Cancella i chunk esistenti (esclusi 'conversation') e re-indica da GitHub.
+    Protetto dalla stessa password di accesso.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body JSON richiesto")
+    if not secrets.compare_digest(body.get("password", ""), ACCESS_PASSWORD):
+        raise HTTPException(status_code=401, detail="Non autorizzato")
+    asyncio.create_task(index_kb_to_vector_store(force=True))
+    return {"status": "re-indicizzazione avviata in background"}
 
 
 @app.delete("/session/{session_id}")
