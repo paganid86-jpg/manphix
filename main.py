@@ -1103,18 +1103,21 @@ async def chat(
             raise HTTPException(status_code=400, detail=error_msg)
 
     async def _chat_generator() -> AsyncGenerator[str, None]:
-        # 1. Recupero conoscenza: hybrid search semantico se disponibile,
-        #    altrimenti fallback al caricamento completo da GitHub
+        # 1. Profilo personale: i learnings (dante.md + altri) sono SEMPRE caricati.
+        #    Sono la "memoria permanente" di Manphix su Dante — piccoli e sempre rilevanti.
+        personal_profile = await get_all_learnings()
+
+        # 2. Contesto aggiuntivo via hybrid search (solo chunk rilevanti alla query)
         relevant_chunks = await hybrid_search(message) if message.strip() else []
         if relevant_chunks:
-            kb_context = "\n\n".join(
+            chunk_context = "\n\n".join(
                 f"[{c['source']}] {c['content']}" for c in relevant_chunks
             )
+            kb_context = f"{personal_profile}\n\n### CONTESTO RILEVANTE ALLA QUERY:\n{chunk_context}"
         else:
-            # Fallback: KB completa da GitHub (comportamento pre-Fase2)
-            knowledge_main   = await get_github_file_content("CLAUDE.md")
-            knowledge_folder = await get_all_learnings()
-            kb_context       = f"{knowledge_main}\n{knowledge_folder}"
+            # Fallback: carica anche CLAUDE.md dal repo brain
+            knowledge_main = await get_github_file_content("CLAUDE.md")
+            kb_context     = f"{knowledge_main}\n{personal_profile}"
 
         # 2. LIVELLO 3: recupero riassunti delle conversazioni passate
         past_summaries = await get_recent_summaries(limit=5)
