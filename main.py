@@ -181,6 +181,10 @@ VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY")
 VOYAGE_MODEL   = "voyage-3-lite"
 VOYAGE_DIMS    = 512        # dimensioni vettore voyage-3-lite
 
+# --- OPENROUTER ---
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+
 AVAILABLE_MODELS = {
     "haiku": {
         "provider": "anthropic",
@@ -205,6 +209,21 @@ AVAILABLE_MODELS = {
         "model_id": "deepseek-r1-distill-qwen-32b",
         "display_name": "DeepSeek R1",
         "description": "Reasoning avanzato (Groq)"
+    },
+    # --- OPENROUTER ---
+    # Modelli gratuiti (:free) non richiedono crediti OpenRouter
+    # Aggiungi qui altri modelli OpenRouter futuri (DeepSeek, Qwen, Llama, ecc.)
+    "nemotron-super": {
+        "provider": "openrouter",
+        "model_id": "nvidia/nemotron-3-super-120b-a12b:free",
+        "display_name": "Nemotron 3 Super 120B",
+        "description": "NVIDIA 120B, 1M ctx — gratuito (OpenRouter)"
+    },
+    "nemotron-nano": {
+        "provider": "openrouter",
+        "model_id": "nvidia/nemotron-3-nano-30b-a3b:free",
+        "display_name": "Nemotron 3 Nano 30B",
+        "description": "NVIDIA 30B leggero, 128K ctx — gratuito (OpenRouter)"
     },
 }
 
@@ -365,6 +384,90 @@ async def stream_ai_response(
             yield f"data: {usage_payload}\n\n"
         except Exception as e:
             logger.error(f"Groq errore: {e}")
+            yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
+            return
+
+    elif provider == "openrouter":
+        # OpenRouter usa il formato OpenAI — compatibile con qualsiasi modello ospitato
+        if not OPENROUTER_API_KEY:
+            yield f'data: {json.dumps({"type": "error", "message": "OPENROUTER_API_KEY non configurata"})}\n\n'
+            return
+        try:
+            # Costruisce la lista messaggi nel formato OpenAI (system come primo messaggio)
+            or_messages = [{"role": "system", "content": system_prompt}]
+            for msg in messages:
+                content = msg["content"]
+                # OpenRouter non supporta vision per tutti i modelli: flatten dei blocchi
+                if isinstance(content, list):
+                    text_parts = [b["text"] for b in content if b.get("type") == "text"]
+                    content = "\n".join(text_parts) or "(contenuto non testuale)"
+                or_messages.append({"role": msg["role"], "content": content})
+
+            full_text  = ""
+            tokens_in  = 0
+            tokens_out = 0
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream(
+                    "POST",
+                    OPENROUTER_BASE_URL,
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                        # Header consigliati da OpenRouter per il ranking e il routing
+                        "HTTP-Referer": "https://manphix.onrender.com",
+                        "X-Title": "Manphix",
+                    },
+                    json={
+                        "model": model_id,
+                        "messages": or_messages,
+                        "stream": True,
+                        "temperature": 0.7,
+                        "max_tokens": 1024,
+                    },
+                ) as response:
+                    if response.status_code != 200:
+                        err = await response.aread()
+                        logger.error(f"OpenRouter HTTP {response.status_code}: {err[:300]}")
+                        yield f'data: {json.dumps({"type": "error", "message": f"OpenRouter errore HTTP {response.status_code}"})}\n\n'
+                        return
+
+                    # Parsa il flusso SSE riga per riga (formato OpenAI)
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:].strip()
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(raw)
+                            # Alcuni modelli mandano usage nell'ultimo chunk
+                            if chunk.get("usage"):
+                                tokens_in  = chunk["usage"].get("prompt_tokens", 0)
+                                tokens_out = chunk["usage"].get("completion_tokens", 0)
+                            delta      = (chunk.get("choices") or [{}])[0].get("delta", {})
+                            text_chunk = delta.get("content") or ""
+                            if text_chunk:
+                                full_text += text_chunk
+                                payload = json.dumps({"type": "delta", "text": text_chunk})
+                                yield f"data: {payload}\n\n"
+                        except json.JSONDecodeError:
+                            continue
+
+            latency_ms = int((time.time() - t_start) * 1000)
+            usage_payload = json.dumps({
+                "type":       "usage",
+                "tokens_in":  tokens_in,
+                "tokens_out": tokens_out,
+                "latency_ms": latency_ms,
+            })
+            yield f"data: {usage_payload}\n\n"
+        except httpx.TimeoutException:
+            logger.error("OpenRouter: timeout risposta")
+            yield f'data: {json.dumps({"type": "error", "message": "Timeout risposta OpenRouter. Riprova."})}\n\n'
+            return
+        except Exception as e:
+            logger.error(f"OpenRouter errore: {e}")
             yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
             return
 
@@ -938,22 +1041,22 @@ async def health():
 
 @app.get("/api/models")
 async def get_models():
-    available = []
-    for key, cfg in AVAILABLE_MODELS.items():
-        if cfg["provider"] == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
-            available.append({
-                "key": key,
-                "display_name": cfg["display_name"],
-                "description": cfg["description"],
-                "provider": cfg["provider"],
-            })
-        elif cfg["provider"] == "groq" and os.environ.get("GROQ_API_KEY"):
-            available.append({
-                "key": key,
-                "display_name": cfg["display_name"],
-                "description": cfg["description"],
-                "provider": cfg["provider"],
-            })
+    """Restituisce i modelli disponibili in base alle API key configurate."""
+    provider_enabled = {
+        "anthropic":  bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "groq":       bool(os.environ.get("GROQ_API_KEY")),
+        "openrouter": bool(OPENROUTER_API_KEY),
+    }
+    available = [
+        {
+            "key":          key,
+            "display_name": cfg["display_name"],
+            "description":  cfg["description"],
+            "provider":     cfg["provider"],
+        }
+        for key, cfg in AVAILABLE_MODELS.items()
+        if provider_enabled.get(cfg["provider"], False)
+    ]
     return {"models": available}
 
 @app.post("/login")

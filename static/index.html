@@ -842,6 +842,19 @@
       inset 0 1px 0 rgba(255,255,255,0.12),
       0 0 16px rgba(255, 209, 102, 0.18);
   }
+  /* Pill OpenRouter: hover arancione per distinzione visiva */
+  .model-pill[data-provider="openrouter"]:hover {
+    border-color: rgba(255, 140, 0, 0.45);
+    color: #ffaa33;
+  }
+  .model-pill[data-provider="openrouter"].active {
+    background: rgba(180, 80, 0, 0.20);
+    border-color: rgba(255, 140, 0, 0.55);
+    color: #ffaa33;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.10),
+      0 0 14px rgba(255, 140, 0, 0.18);
+  }
 
   .system-msg {
     text-align: center;
@@ -1536,11 +1549,12 @@ requestAnimationFrame(draw);
     const container = document.getElementById('model-selector');
     // Rimuovi pill esistenti (mantieni label)
     container.querySelectorAll('.model-pill').forEach(el => el.remove());
-    const providerIcon = { anthropic: '🟣', groq: '🟢' };
+    const providerIcon = { anthropic: '🟣', groq: '🟢', openrouter: '🟠' };
     models.forEach(m => {
       const pill = document.createElement('button');
       pill.className = 'model-pill' + (m.key === currentModel ? ' active' : '');
       pill.dataset.key = m.key;
+      pill.dataset.provider = m.provider;
       pill.title = m.description || '';
       pill.innerHTML = `${providerIcon[m.provider] || '⚪'} ${m.display_name}`;
       pill.onclick = () => selectModel(m.key, m.display_name);
