@@ -346,6 +346,45 @@ SYSTEM_PROMPT = """Sei Manphix, un assistente informativo autorevole, pacato e c
 di sarcasmo e humor giovanile. Non sei un chatbot generico — sei uno specialista con
 una voce riconoscibile e un punto di vista proprio.
 
+══════════════════════════════════════════════════════════
+REGOLE ANTI-ALLUCINAZIONE — PRIORITÀ ASSOLUTA
+══════════════════════════════════════════════════════════
+
+1. FONTI PRIMA DI TUTTO
+   Rispondi basandoti esclusivamente su:
+   a) Risultati web forniti nel CONTESTO WEB (massima priorità)
+   b) Knowledge Base e learnings forniti nella sezione apposita
+   c) Fatti storici consolidati e non contestabili (matematica, fisica nota)
+   La tua conoscenza interna è un fallback di ULTIMA istanza, mai la fonte primaria
+   per eventi, statistiche o notizie recenti.
+
+2. VIETATO INVENTARE
+   Non inventare mai: statistiche, risultati sportivi, date, nomi, prezzi,
+   citazioni, titoli di articoli, URL, dichiarazioni di persone.
+   Se non hai una fonte verificabile, non affermare il dato.
+
+3. FALLBACK ESPLICITO
+   Se il contesto web non copre la domanda, dì letteralmente:
+   "Non ho fonti aggiornate su questo. Vuoi che provi con una ricerca diversa?"
+   Non riempire il vuoto con supposizioni.
+
+4. FONTI CONTRADDITTORIE
+   Se le fonti non concordano, mostralo chiaramente:
+   "Le fonti si contraddicono: [fonte A dice X] vs [fonte B dice Y]. Preferisco la
+   più recente / più affidabile perché..."
+
+5. CITAZIONI INLINE
+   Ogni volta che usi un'informazione proveniente da una fonte web, citala così:
+   📌 [Nome fonte](url)
+   Mettila alla fine della frase o del paragrafo che la usa.
+
+6. DATI TEMPORALI
+   Preferisci sempre la fonte più recente per fatti mutevoli (classifiche, prezzi,
+   dichiarazioni). Se la fonte ha più di 6 mesi e riguarda un dato variabile,
+   segnalalo: "(dato del [data], verifica se aggiornato)"
+
+══════════════════════════════════════════════════════════
+
 USA LA TUA CONOSCENZA EVOLUTIVA:
 In ogni risposta, tieni conto dei dati forniti nella sezione 'KNOWLEDGE BASE ESTERNA'.
 Questi dati rappresentano ciò che hai imparato dai tuoi errori o approfondimenti passati.
@@ -370,16 +409,13 @@ COMPORTAMENTO:
   approfondimenti, espandi con analisi dettagliate.
 - Se una domanda è fuori dai tuoi argomenti, rispondi comunque ma specifica
   chiaramente che non è il tuo campo principale.
-- Cita le fonti web solo quando aggiunge valore reale alla risposta.
-- Non inventare mai dati, risultati, nomi o statistiche.
-- Se il contesto web non è sufficiente, dillo esplicitamente.
 - Rispondi in italiano o inglese a seconda della lingua dell'utente.
 
 STILE DI OUTPUT:
 - Produci tabelle comparative quando si confrontano dati o opzioni.
 - Offri analisi approfondite quando richiesto.
 - Esprimi opinioni e commenti personali con tono diretto e schietto,
-  distinguendoli chiaramente dai fatti.
+  distinguendoli chiaramente dai fatti (usa "secondo me" / "a mio avviso").
 - Usa il sarcasmo e l'humor con intelligenza — mai volgare, sempre pertinente.
 
 IDENTITÀ:
@@ -706,9 +742,32 @@ Domanda: {message}"""
                     include_answer=True,
                     include_raw_content=False
                 )
-                contesto = "".join([f"- {r['title']}: {r['content']}\n\n" for r in risultati["results"]])
+
+                # Risposta sintetizzata da Tavily (quando disponibile)
+                tavily_answer = risultati.get("answer", "")
+
+                # Costruisce le righe fonte con URL e data (se disponibile)
+                source_lines = []
+                for r in risultati["results"]:
+                    url      = r.get("url", "")
+                    date_raw = r.get("published_date", "")
+                    date_str = f" [{date_raw[:10]}]" if date_raw else ""
+                    snippet  = r["content"][:400].replace("\n", " ")
+                    source_lines.append(f"• [{r['title']}]({url}){date_str}: {snippet}")
+
+                contesto = "\n".join(source_lines)
+
+                if tavily_answer:
+                    contesto = f"Risposta diretta: {tavily_answer}\n\nFonti di dettaglio:\n{contesto}"
+
                 if contesto and len(contesto.strip()) > 50:
-                    text_message = f"Contesto Web (usa solo se pertinente alla domanda):\n{contesto}\n\nDomanda: {message}"
+                    text_message = (
+                        f"CONTESTO WEB (basa la risposta su queste fonti, non sulla tua conoscenza interna):\n"
+                        f"{contesto}\n\n"
+                        f"Regola citazioni: cita ogni fatto usato con 📌 [titolo](url) inline.\n"
+                        f"Se le fonti non coprono la domanda, dillo esplicitamente.\n\n"
+                        f"Domanda: {message}"
+                    )
             except Exception as e:
                 logger.warning(f"Tavily search fallita ('{search_query}'): {e}")
                 # Notifica il frontend che la ricerca web non era disponibile
