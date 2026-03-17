@@ -1103,21 +1103,23 @@ async def chat(
             raise HTTPException(status_code=400, detail=error_msg)
 
     async def _chat_generator() -> AsyncGenerator[str, None]:
-        # 1. Profilo personale: i learnings (dante.md + altri) sono SEMPRE caricati.
-        #    Sono la "memoria permanente" di Manphix su Dante — piccoli e sempre rilevanti.
+        # 1. KB completa sempre caricata — questo garantisce che Manphix sappia
+        #    sempre chi è Dante indipendentemente dalla query o dallo stato del vector store.
+        knowledge_main   = await get_github_file_content("CLAUDE.md")
         personal_profile = await get_all_learnings()
+        kb_context       = f"{knowledge_main}\n{personal_profile}"
 
-        # 2. Contesto aggiuntivo via hybrid search (solo chunk rilevanti alla query)
+        if not knowledge_main and not personal_profile:
+            logger.warning("KB vuota — CLAUDE.md e learnings non raggiungibili da GitHub")
+
+        # 2. Hybrid search: arricchisce il contesto con chunk semanticamente rilevanti.
+        #    È un'aggiunta, non un sostituto — la KB base è già presente sopra.
         relevant_chunks = await hybrid_search(message) if message.strip() else []
         if relevant_chunks:
             chunk_context = "\n\n".join(
                 f"[{c['source']}] {c['content']}" for c in relevant_chunks
             )
-            kb_context = f"{personal_profile}\n\n### CONTESTO RILEVANTE ALLA QUERY:\n{chunk_context}"
-        else:
-            # Fallback: carica anche CLAUDE.md dal repo brain
-            knowledge_main = await get_github_file_content("CLAUDE.md")
-            kb_context     = f"{knowledge_main}\n{personal_profile}"
+            kb_context += f"\n\n### CONTESTO SEMANTICO AGGIUNTIVO:\n{chunk_context}"
 
         # 2. LIVELLO 3: recupero riassunti delle conversazioni passate
         past_summaries = await get_recent_summaries(limit=5)
