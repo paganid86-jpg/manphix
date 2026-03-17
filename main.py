@@ -1166,77 +1166,93 @@ async def chat(
         text_message = message
         sources_data: list = []  # fonti Tavily strutturate, inviate al frontend come SSE
         if message.strip():
-            # --- MIGLIORIA 4: logging errori query preprocessing ---
+            # Preprocessing: classifica la query per decidere se fare web search e con quale topic
+            should_search = True
+            search_query = message
+            search_topic = "general"
             try:
                 query_response = await anthropic_client.messages.create(
                     model="claude-haiku-4-5-20251001",
-                    max_tokens=100,
+                    max_tokens=150,
                     messages=[{
                         "role": "user",
-                        "content": f"""Trasforma questa domanda in una query di ricerca web ottimale.
-Rispondi SOLO con la query, niente altro. Max 10 parole. In italiano o inglese a seconda della lingua.
-Aggiungi l'anno corrente (2026) se la domanda riguarda eventi recenti o notizie.
+                        "content": f"""Analizza questa domanda e rispondi SOLO con JSON valido, niente altro.
+
+Formato richiesto:
+{{"query": "query ottimizzata max 10 parole", "search": true o false, "topic": "news" o "general"}}
+
+Regole:
+- search=false se: codice, matematica, logica, concetti generali, richieste creative, spiegazioni teoriche
+- search=true se: notizie recenti, eventi attuali, prezzi, meteo, sport, informazioni che cambiano nel tempo
+- topic="news" SOLO se cerca notizie o eventi attuali; altrimenti "general"
+- Aggiungi 2026 nella query se la domanda riguarda eventi recenti
 
 Domanda: {message}"""
                     }]
                 )
-                search_query = query_response.content[0].text.strip()
+                raw = query_response.content[0].text.strip()
+                parsed = json.loads(raw)
+                search_query = parsed.get("query", message)
+                should_search = bool(parsed.get("search", True))
+                search_topic = parsed.get("topic", "general")
             except anthropic.RateLimitError:
                 logger.warning("Anthropic query preprocessing: quota esaurita, uso messaggio originale")
-                search_query = message
             except Exception as e:
                 logger.warning(f"Anthropic query preprocessing: {e}, uso messaggio originale")
-                search_query = message
 
-            try:
-                risultati = tavily_client.search(
-                    search_query,
-                    max_results=5,
-                    search_depth="advanced",
-                    topic="news",
-                    include_answer=True,
-                    include_raw_content=False
-                )
+            if not should_search:
+                logger.info(f"Web search skippata per query classificata come locale: '{message[:60]}'")
 
-                # Risposta sintetizzata da Tavily (quando disponibile)
-                tavily_answer = risultati.get("answer", "")
-
-                # Costruisce le righe fonte con URL e data (se disponibile)
-                source_lines = []
-                for r in risultati["results"]:
-                    url      = r.get("url", "")
-                    date_raw = r.get("published_date", "")
-                    date_str = f" [{date_raw[:10]}]" if date_raw else ""
-                    snippet  = r["content"][:400].replace("\n", " ")
-                    source_lines.append(f"• [{r['title']}]({url}){date_str}: {snippet}")
-                    # Fonte strutturata per il frontend
-                    if url:
-                        sources_data.append({
-                            "title": r.get("title", url),
-                            "url":   url,
-                            "date":  date_raw[:10] if date_raw else ""
-                        })
-
-                contesto = "\n".join(source_lines)
-
-                if tavily_answer:
-                    contesto = f"Risposta diretta: {tavily_answer}\n\nFonti di dettaglio:\n{contesto}"
-
-                if contesto and len(contesto.strip()) > 50:
-                    text_message = (
-                        f"CONTESTO WEB (usa queste fonti per domande su eventi, notizie, fatti esterni):\n"
-                        f"⚠ ECCEZIONE ASSOLUTA: Per domande su Dante Pagani (il tuo creatore), "
-                        f"su te stesso o su Manphix, IGNORA questo contesto web e usa SOLO "
-                        f"le informazioni nella sezione 'IL TUO CREATORE' del system prompt.\n"
-                        f"{contesto}\n\n"
-                        f"Regola citazioni: cita ogni fatto usato con 📌 [titolo](url) inline.\n"
-                        f"Se le fonti non coprono la domanda, dillo esplicitamente.\n\n"
-                        f"Domanda: {message}"
+            if should_search:
+                try:
+                    risultati = tavily_client.search(
+                        search_query,
+                        max_results=5,
+                        search_depth="advanced",
+                        topic=search_topic,
+                        include_answer=True,
+                        include_raw_content=False
                     )
-            except Exception as e:
-                logger.warning(f"Tavily search fallita ('{search_query}'): {e}")
-                # Notifica il frontend che la ricerca web non era disponibile
-                yield f'data: {json.dumps({"type": "search_skipped", "reason": "Web search non disponibile — rispondo con conoscenza locale."})}\n\n'
+
+                    # Risposta sintetizzata da Tavily (quando disponibile)
+                    tavily_answer = risultati.get("answer", "")
+
+                    # Costruisce le righe fonte con URL e data (se disponibile)
+                    source_lines = []
+                    for r in risultati["results"]:
+                        url      = r.get("url", "")
+                        date_raw = r.get("published_date", "")
+                        date_str = f" [{date_raw[:10]}]" if date_raw else ""
+                        snippet  = r["content"][:400].replace("\n", " ")
+                        source_lines.append(f"• [{r['title']}]({url}){date_str}: {snippet}")
+                        # Fonte strutturata per il frontend
+                        if url:
+                            sources_data.append({
+                                "title": r.get("title", url),
+                                "url":   url,
+                                "date":  date_raw[:10] if date_raw else ""
+                            })
+
+                    contesto = "\n".join(source_lines)
+
+                    if tavily_answer:
+                        contesto = f"Risposta diretta: {tavily_answer}\n\nFonti di dettaglio:\n{contesto}"
+
+                    if contesto and len(contesto.strip()) > 50:
+                        text_message = (
+                            f"CONTESTO WEB (usa queste fonti per domande su eventi, notizie, fatti esterni):\n"
+                            f"⚠ ECCEZIONE ASSOLUTA: Per domande su Dante Pagani (il tuo creatore), "
+                            f"su te stesso o su Manphix, IGNORA questo contesto web e usa SOLO "
+                            f"le informazioni nella sezione 'IL TUO CREATORE' del system prompt.\n"
+                            f"{contesto}\n\n"
+                            f"Regola citazioni: cita ogni fatto usato con 📌 [titolo](url) inline.\n"
+                            f"Se le fonti non coprono la domanda, dillo esplicitamente.\n\n"
+                            f"Domanda: {message}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Tavily search fallita ('{search_query}'): {e}")
+                    # Notifica il frontend che la ricerca web non era disponibile
+                    yield f'data: {json.dumps({"type": "search_skipped", "reason": "Web search non disponibile — rispondo con conoscenza locale."})}\n\n'
 
         # 5. Gestione file allegato
         db_message      = text_message
