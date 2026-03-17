@@ -182,8 +182,18 @@ VOYAGE_MODEL   = "voyage-3-lite"
 VOYAGE_DIMS    = 512        # dimensioni vettore voyage-3-lite
 
 # --- OPENROUTER ---
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# --- PROFILO DANTE (caricato da file locale — mai dipende da GitHub) ---
+_DANTE_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dante.md")
+try:
+    with open(_DANTE_MD_PATH, "r", encoding="utf-8") as _f:
+        DANTE_PROFILE = _f.read()
+    logging.getLogger("manphix").info(f"Profilo Dante caricato ({len(DANTE_PROFILE)} caratteri)")
+except FileNotFoundError:
+    DANTE_PROFILE = ""
+    logging.getLogger("manphix").warning("dante.md non trovato — profilo utente non disponibile")
 
 AVAILABLE_MODELS = {
     "haiku": {
@@ -1103,14 +1113,16 @@ async def chat(
             raise HTTPException(status_code=400, detail=error_msg)
 
     async def _chat_generator() -> AsyncGenerator[str, None]:
-        # 1. KB completa sempre caricata — questo garantisce che Manphix sappia
-        #    sempre chi è Dante indipendentemente dalla query o dallo stato del vector store.
+        # 1. Profilo Dante — da file locale, sempre disponibile, non dipende da GitHub
+        kb_context = DANTE_PROFILE
+
+        # 2. KB da GitHub (CLAUDE.md + learnings) — arricchimento opzionale
         knowledge_main   = await get_github_file_content("CLAUDE.md")
         personal_profile = await get_all_learnings()
-        kb_context       = f"{knowledge_main}\n{personal_profile}"
-
-        if not knowledge_main and not personal_profile:
-            logger.warning("KB vuota — CLAUDE.md e learnings non raggiungibili da GitHub")
+        if knowledge_main or personal_profile:
+            kb_context += f"\n\n{knowledge_main}\n{personal_profile}"
+        else:
+            logger.warning("KB GitHub non raggiungibile — uso solo profilo locale dante.md")
 
         # 2. Hybrid search: arricchisce il contesto con chunk semanticamente rilevanti.
         #    È un'aggiunta, non un sostituto — la KB base è già presente sopra.
