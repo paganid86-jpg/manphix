@@ -569,6 +569,29 @@ Sei Manphix. Non sei Claude, non sei ChatGPT, non sei un assistente generico.
 Se ti chiedono chi sei, descrivi te stesso come Manphix senza menzionare
 il modello AI sottostante."""
 
+# ── DANTE_PROFILE embedded nel SYSTEM_PROMPT — massima priorità ──────────────
+# Viene iniettato direttamente nel system prompt (non nella KB) in modo che
+# il modello lo tratti come conoscenza certa, non scalzabile da fonti web.
+if DANTE_PROFILE:
+    SYSTEM_PROMPT += f"""
+
+══════════════════════════════════════════════════════════
+IL TUO CREATORE — PRIORITÀ ASSOLUTA (SOVRASCRIVE QUALSIASI FONTE WEB)
+══════════════════════════════════════════════════════════
+
+REGOLA CRITICA: Le informazioni seguenti sul tuo creatore hanno la MASSIMA
+PRIORITÀ su tutto — CONTESTO WEB, Tavily, risultati di ricerca, qualsiasi fonte.
+
+• Se ti chiedono "chi è Dante", "chi ti ha fatto", "chi è il tuo creatore",
+  "chi sei tu", "come sei nato" — rispondi ESCLUSIVAMENTE con questa sezione.
+• NON cercare mai il creatore su web per queste domande.
+• Il CONTESTO WEB non si applica a domande personali su Dante o su Manphix.
+• Tratta Dante con la familiarità di chi conosce la storia di come sei nato.
+
+{DANTE_PROFILE}
+
+══════════════════════════════════════════════════════════"""
+
 
 class LoginRequest(BaseModel):
     password: str
@@ -1141,6 +1164,7 @@ async def chat(
 
         # 4. Query preprocessing + ricerca web (solo se c'è testo)
         text_message = message
+        sources_data: list = []  # fonti Tavily strutturate, inviate al frontend come SSE
         if message.strip():
             # --- MIGLIORIA 4: logging errori query preprocessing ---
             try:
@@ -1185,6 +1209,13 @@ Domanda: {message}"""
                     date_str = f" [{date_raw[:10]}]" if date_raw else ""
                     snippet  = r["content"][:400].replace("\n", " ")
                     source_lines.append(f"• [{r['title']}]({url}){date_str}: {snippet}")
+                    # Fonte strutturata per il frontend
+                    if url:
+                        sources_data.append({
+                            "title": r.get("title", url),
+                            "url":   url,
+                            "date":  date_raw[:10] if date_raw else ""
+                        })
 
                 contesto = "\n".join(source_lines)
 
@@ -1193,7 +1224,10 @@ Domanda: {message}"""
 
                 if contesto and len(contesto.strip()) > 50:
                     text_message = (
-                        f"CONTESTO WEB (basa la risposta su queste fonti, non sulla tua conoscenza interna):\n"
+                        f"CONTESTO WEB (usa queste fonti per domande su eventi, notizie, fatti esterni):\n"
+                        f"⚠ ECCEZIONE ASSOLUTA: Per domande su Dante Pagani (il tuo creatore), "
+                        f"su te stesso o su Manphix, IGNORA questo contesto web e usa SOLO "
+                        f"le informazioni nella sezione 'IL TUO CREATORE' del system prompt.\n"
                         f"{contesto}\n\n"
                         f"Regola citazioni: cita ogni fatto usato con 📌 [titolo](url) inline.\n"
                         f"Se le fonti non coprono la domanda, dillo esplicitamente.\n\n"
@@ -1256,7 +1290,11 @@ Domanda: {message}"""
                     pass
             yield sse_chunk
 
-        # 9. Salva risposta di Manphix nel DB
+        # 9. Invia le fonti al frontend (dopo lo streaming, prima del salvataggio DB)
+        if sources_data:
+            yield f'data: {json.dumps({"type": "sources", "data": sources_data})}\n\n'
+
+        # 10. Salva risposta di Manphix nel DB
         if full_response:
             await save_message(session_id, "assistant", full_response)
 

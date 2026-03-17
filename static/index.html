@@ -931,6 +931,88 @@
   .copy-btn:hover { color: var(--accent3); border-color: rgba(180,80,255,0.38); background: rgba(255,255,255,0.09); }
   .copy-btn.copied { color: #7fffc4; border-color: rgba(0,200,80,0.30); background: rgba(0,180,80,0.12); }
 
+  /* ── Wrapper colonna per content + sources (solo bot) ─────────────── */
+  .message.bot .msg-body {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  /* ── Bottone FONTI e panel dropdown ──────────────────────────────── */
+  .sources-footer { position: relative; }
+  .sources-btn {
+    background: rgba(0,180,255,0.07);
+    border: 1px solid rgba(0,229,255,0.22);
+    border-radius: 7px;
+    color: var(--accent-cyan);
+    font-family: var(--mono);
+    font-size: 0.59rem;
+    padding: 3px 10px;
+    cursor: pointer;
+    letter-spacing: 0.07em;
+    transition: background 0.16s, border-color 0.16s;
+  }
+  .sources-btn:hover {
+    background: rgba(0,180,255,0.16);
+    border-color: rgba(0,229,255,0.45);
+  }
+  .sources-btn.active { border-color: rgba(0,229,255,0.55); background: rgba(0,180,255,0.18); }
+
+  .sources-panel {
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    min-width: 260px;
+    max-width: 520px;
+    background: rgba(8,8,24,0.97);
+    backdrop-filter: blur(24px) saturate(1.4);
+    border: 1px solid rgba(0,229,255,0.22);
+    border-radius: 10px;
+    padding: 10px 14px;
+    z-index: 60;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(0,229,255,0.06);
+    animation: panelIn 0.18s var(--ease);
+  }
+  .sources-panel.open { display: flex; }
+  @keyframes panelIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+
+  .sources-panel-title {
+    font-family: var(--mono);
+    font-size: 0.57rem;
+    color: var(--text-dim);
+    letter-spacing: 0.09em;
+    padding-bottom: 5px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+  }
+  .sources-panel-item {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding-bottom: 5px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .sources-panel-item:last-child { border-bottom: none; padding-bottom: 0; }
+  .sources-panel-item a {
+    font-size: 0.78rem;
+    color: var(--accent-cyan);
+    text-decoration: none;
+    border-bottom: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: block;
+    max-width: 480px;
+  }
+  .sources-panel-item a:hover { text-decoration: underline; }
+  .sources-panel-date {
+    font-size: 0.60rem;
+    color: var(--text-dim);
+    font-family: var(--mono);
+  }
+
   /* ── Markdown: headers, link, tabelle ────────────────────────────────── */
   .msg-content h1 { font-family: var(--sans); font-size: 1.15rem; font-weight: 700; color: var(--accent3); margin: 14px 0 6px; }
   .msg-content h2 { font-family: var(--sans); font-size: 1.02rem; font-weight: 600; color: var(--accent3); margin: 12px 0 5px; }
@@ -1632,7 +1714,12 @@ requestAnimationFrame(draw);
     const copyBtn = role === 'bot'
       ? `<button class="copy-btn" onclick="copyMessage(this)" title="Copia messaggio">COPY</button>`
       : '';
-    div.innerHTML = `${copyBtn}<div class="msg-avatar">${avatar}</div><div class="msg-content">${imgHtml}${content ? formatMessage(content) : ''}</div>`;
+    const contentHtml = `${imgHtml}${content ? formatMessage(content) : ''}`;
+    if (role === 'bot') {
+      div.innerHTML = `${copyBtn}<div class="msg-avatar">${avatar}</div><div class="msg-body"><div class="msg-content">${contentHtml}</div></div>`;
+    } else {
+      div.innerHTML = `${copyBtn}<div class="msg-avatar">${avatar}</div><div class="msg-content">${contentHtml}</div>`;
+    }
     msgs.appendChild(div);
     msgs.scrollTop = msgs.scrollHeight;
     return div;
@@ -1646,6 +1733,46 @@ requestAnimationFrame(draw);
       btn.classList.add('copied');
       setTimeout(() => { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 2000);
     }).catch(() => showToast('Copia non riuscita', 'error'));
+  }
+
+  function addSourcesButton(bubble, sources) {
+    if (!sources || !sources.length) return;
+    const msgBody = bubble.querySelector('.msg-body');
+    if (!msgBody) return;
+
+    const footer = document.createElement('div');
+    footer.className = 'sources-footer';
+
+    const btn = document.createElement('button');
+    btn.className = 'sources-btn';
+    btn.textContent = `FONTI (${sources.length})`;
+
+    const panel = document.createElement('div');
+    panel.className = 'sources-panel';
+    panel.innerHTML = `<div class="sources-panel-title">FONTI WEB</div>` +
+      sources.map(s => {
+        const safeUrl   = s.url   ? escapeHtml(s.url)   : '#';
+        const safeTitle = s.title ? escapeHtml(s.title) : safeUrl;
+        const dateHtml  = s.date  ? `<div class="sources-panel-date">${escapeHtml(s.date)}</div>` : '';
+        return `<div class="sources-panel-item"><a href="${safeUrl}" target="_blank" rel="noopener noreferrer" title="${safeTitle}">${safeTitle}</a>${dateHtml}</div>`;
+      }).join('');
+
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      panel.classList.toggle('open');
+      btn.classList.toggle('active');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!footer.contains(e.target)) {
+        panel.classList.remove('open');
+        btn.classList.remove('active');
+      }
+    });
+
+    footer.appendChild(btn);
+    footer.appendChild(panel);
+    msgBody.appendChild(footer);
   }
 
   function setNeuralState(state) {
@@ -1863,6 +1990,10 @@ requestAnimationFrame(draw);
             updateNeuralStatsReal(evt);
           } else if (evt.type === 'done') {
             // streaming complete
+          } else if (evt.type === 'sources') {
+            if (evt.data && evt.data.length && botBubble) {
+              addSourcesButton(botBubble, evt.data);
+            }
           } else if (evt.type === 'search_skipped') {
             // Web search non disponibile — mostra piccolo banner sotto il thinking
             showToast(evt.reason || 'Web search non disponibile', 'warning', 5000);
