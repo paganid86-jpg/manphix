@@ -216,8 +216,8 @@ AVAILABLE_MODELS = {
     },
     "deepseek-r1": {
         "provider": "groq",
-        "model_id": "deepseek-r1-distill-qwen-32b",
-        "display_name": "DeepSeek R1",
+        "model_id": "qwen/qwen3-32b",
+        "display_name": "Qwen3 32B",
         "description": "Reasoning avanzato (Groq)"
     },
     # --- OPENROUTER ---
